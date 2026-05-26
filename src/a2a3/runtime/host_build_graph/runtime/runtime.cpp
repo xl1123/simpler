@@ -45,6 +45,7 @@ Runtime::Runtime() {
     initial_ready_count = 0;
     worker_count = 0;
     aicpu_thread_num = 1;
+    sdma_prefetch_workspace = nullptr;
     tensor_info_storage_ = nullptr;
     tensor_info_storage_bytes_ = 0;
     tensor_allocation_storage_ = nullptr;

@@ -213,6 +213,11 @@ public:
     // round-robin across the assigned cores. See AicpuExecutor::init.
     int aicpu_thread_num;
 
+    // Optional host-created STARS channel workspace. Used by the shared a2a3
+    // platform DeviceRunner for SDMA prefetch setup/cleanup; host_build_graph
+    // does not consume it on device.
+    void *sdma_prefetch_workspace;
+
     // Task storage
     Task tasks[RUNTIME_MAX_TASKS];  // Fixed-size task array
 

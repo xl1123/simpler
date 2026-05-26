@@ -37,7 +37,12 @@ Runtime::Runtime() {
     task_window_size = 0;
     heap_size = 0;
     dep_pool_size = 0;
+    prefetch_mode = Runtime::PREFETCH_MODE_TWOSLOT;
+    sdma_prefetch_min_bytes = 256 * 1024;
+    sdma_prefetch_suppress_window = 2;
+    sdma_prefetch_debug = false;
     orch_to_sched = false;
+    sdma_prefetch_workspace = nullptr;
 
     // Initialize device orchestration state
     gm_sm_ptr_ = nullptr;

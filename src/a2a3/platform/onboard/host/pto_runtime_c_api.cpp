@@ -31,6 +31,7 @@
 #include "common/unified_log.h"
 #include "device_runner.h"
 #include "host_log.h"
+#include "host/host_prefetch_setup.h"
 #include "host/raii_scope_guard.h"
 #include "runtime.h"
 
@@ -144,7 +145,10 @@ DeviceContextHandle create_device_context(void) {
     }
 }
 
-void destroy_device_context(DeviceContextHandle ctx) { delete static_cast<DeviceRunner *>(ctx); }
+void destroy_device_context(DeviceContextHandle ctx) {
+    host_prefetch_teardown(nullptr);
+    delete static_cast<DeviceRunner *>(ctx);
+}
 
 size_t get_runtime_size(void) { return sizeof(Runtime); }
 
@@ -218,6 +222,7 @@ int copy_from_device_ctx(DeviceContextHandle ctx, void *host_ptr, const void *de
 int finalize_device(DeviceContextHandle ctx) {
     if (ctx == NULL) return -1;
     try {
+        host_prefetch_teardown(nullptr);
         return static_cast<DeviceRunner *>(ctx)->finalize();
     } catch (...) {
         return -1;

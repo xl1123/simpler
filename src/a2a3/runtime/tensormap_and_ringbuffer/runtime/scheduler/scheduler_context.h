@@ -11,6 +11,10 @@
 #ifndef SCHEDULER_CONTEXT_H
 #define SCHEDULER_CONTEXT_H
 
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+
 #include "common/l2_perf_profiling.h"
 #include "common/unified_log.h"
 #include "scheduler_types.h"
@@ -171,6 +175,27 @@ private:
     // Platform AICore-register base array (set by AicpuExecutor before init()).
     uint64_t regs_{0};
 
+    uint32_t prefetch_mode_{0};
+    size_t prefetch_min_bytes_{0};
+    uint32_t prefetch_suppress_window_{0};
+    bool prefetch_debug_enabled_{false};
+    mutable std::atomic<uint64_t> prefetch_considered_count_{0};
+    mutable std::atomic<uint64_t> prefetch_task_count_{0};
+    mutable std::atomic<uint64_t> prefetch_tensor_count_{0};
+    mutable std::atomic<uint64_t> prefetch_total_bytes_{0};
+    mutable std::atomic<uint64_t> prefetch_skip_not_sdma_{0};
+    mutable std::atomic<uint64_t> prefetch_skip_not_available_{0};
+    mutable std::atomic<uint64_t> prefetch_skip_null_payload_{0};
+    mutable std::atomic<uint64_t> prefetch_skip_below_min_bytes_{0};
+    mutable std::atomic<uint64_t> prefetch_skip_no_valid_tensor_{0};
+    mutable std::atomic<uint64_t> prefetch_skip_scheduler_suppressed_{0};
+    mutable std::atomic<uint64_t> prefetch_skip_instr_kernel_scheduler_{0};
+    mutable std::atomic<uint64_t> prefetch_skip_instr_feature_disabled_{0};
+    mutable std::atomic<uint64_t> prefetch_control_cycles_{0};
+    mutable std::atomic<uint64_t> prefetch_eligible_control_cycles_{0};
+    mutable std::atomic<uint32_t> prefetch_scheduler_suppress_remaining_[RUNTIME_MAX_WORKER]{};
+    mutable std::atomic<uint8_t> prefetch_instr_kernel_seen_[RUNTIME_MAX_FUNC_ID]{};
+
 #if PTO2_PROFILING
     // PMU profiling: physical core IDs for PMU MMIO base resolution.
     // Separate storage because CoreExecState's 64-byte budget has no room for
@@ -248,6 +273,17 @@ private:
         int32_t thread_idx, PTO2ResourceShape shape, CoreTracker::DispatchPhase phase, PTO2LocalReadyBuffer &local_buf,
         CoreTracker &tracker, bool &entered_drain, bool &made_progress, bool &try_pushed
     );
+
+    bool should_attempt_task_prefetch(const PTO2TaskSlotState &slot_state, int channel_idx) const;
+    void issue_task_prefetch(const PTO2TaskSlotState &slot_state, int channel_idx) const;
+    void maybe_prefetch_next_task(
+        int32_t thread_idx, PTO2ResourceShape shape, CoreTracker::DispatchPhase phase, CoreTracker &tracker,
+        PTO2TaskSlotState *const *batch, int got, int bi, CoreTracker::BitStates candidate_cores
+    );
+    uint32_t get_scheduler_prefetch_suppress_window(const PTO2TaskSlotState &slot_state) const;
+    static PTO2TaskSlotState *select_next_task_prefetch_target(PTO2TaskSlotState *const *batch, int got, int bi);
+    static int get_scheduler_prefetch_channel_idx(int channel_idx);
+    static uint64_t get_prefetch_logical_span(const PTO2TaskPayload &payload);
 
     // One pass of "Phase 4" in the resolve_and_dispatch loop: IDLE-stage dispatch
     // for MIX then (if no mix residual) AIC/AIV; mid-flush of local buffers; then

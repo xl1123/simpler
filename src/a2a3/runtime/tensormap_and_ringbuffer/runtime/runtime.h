@@ -191,6 +191,18 @@ public:
     uint64_t heap_size;
     uint64_t dep_pool_size;
 
+    enum PrefetchMode : uint32_t {
+        PREFETCH_MODE_BASELINE = 0,
+        PREFETCH_MODE_TWOSLOT = 1,
+        PREFETCH_MODE_SDMA = 2,
+        PREFETCH_MODE_SDMA_FAKE = 3,
+    };
+
+    uint32_t prefetch_mode;
+    uint64_t sdma_prefetch_min_bytes;
+    uint32_t sdma_prefetch_suppress_window;
+    bool sdma_prefetch_debug;
+
     // PTO2 integration: kernel_id -> GM function_bin_addr mapping
     // NOTE: Made public for direct access from aicore code
     uint64_t func_id_to_addr_[RUNTIME_MAX_FUNC_ID];
@@ -200,6 +212,8 @@ public:
     // When false (default), orchestrator threads exit after orchestration without dispatching tasks.
     // Controlled via PTO2_ORCH_TO_SCHED environment variable.
     bool orch_to_sched;
+
+    void *sdma_prefetch_workspace;
 
 private:
     // Kernel binary tracking for cleanup

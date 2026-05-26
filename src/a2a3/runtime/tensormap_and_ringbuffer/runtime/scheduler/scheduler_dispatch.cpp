@@ -16,6 +16,7 @@
 #include "common.h"  // debug_assert
 
 #include "common/unified_log.h"
+#include "aicpu/device_prefetch.h"
 #include "aicpu/device_time.h"
 #include "aicpu/platform_regs.h"
 #include "callable.h"
@@ -41,6 +42,12 @@
 
 namespace {
 inline constexpr int32_t PTO2_DEFERRED_RELEASE_CAP = 256;
+
+struct PrefetchFeatureTier {
+    bool enable_instr;
+    uint32_t instr_cap_bytes;
+    uint32_t min_suppress_window;
+};
 }
 
 const char *SchedulerContext::shape_name(PTO2ResourceShape shape) {
@@ -103,6 +110,266 @@ int SchedulerContext::pop_ready_tasks_batch(
     int count = sched_->get_ready_tasks_batch(shape, local_buf, out, max_count);
 #endif
     return count;
+}
+
+uint64_t SchedulerContext::get_prefetch_logical_span(const PTO2TaskPayload &payload) {
+    if (payload.prefetch_issue_bytes == 0) {
+        return 0;
+    }
+    return payload.prefetch_filter_bytes / payload.prefetch_issue_bytes;
+}
+
+static PrefetchFeatureTier classify_prefetch_features(const PTO2TaskPayload &payload) {
+    static constexpr uint64_t kSmallIssueBytes = 20 * 1024;
+    static constexpr uint64_t kSmallFilterBytes = 384 * 1024;
+    static constexpr uint64_t kInstrEnableIssueBytes = 32 * 1024;
+    static constexpr uint64_t kMidSpanThreshold = 16;
+    static constexpr uint64_t kWideSpanThreshold = 48;
+
+    const uint64_t issue_bytes = payload.prefetch_issue_bytes;
+    const uint64_t filter_bytes = payload.prefetch_filter_bytes;
+    const uint64_t logical_span = issue_bytes == 0 ? 0 : filter_bytes / issue_bytes;
+    const bool structured_block_task = (payload.tensor_count == 4) &&
+                                       (payload.scalar_count == 2 || payload.scalar_count == 4 ||
+                                        payload.scalar_count == 6);
+
+    if (!structured_block_task) {
+        return {false, 0u, 31u};
+    }
+    if (issue_bytes < kSmallIssueBytes || filter_bytes < kSmallFilterBytes) {
+        return {false, 0u, 31u};
+    }
+    if (logical_span > kWideSpanThreshold) {
+        return {false, 0u, 31u};
+    }
+    if (logical_span > kMidSpanThreshold) {
+        return {false, 0u, 15u};
+    }
+    if (issue_bytes >= kInstrEnableIssueBytes) {
+        return {true, 512u, 11u};
+    }
+    return {false, 0u, 23u};
+}
+
+uint32_t SchedulerContext::get_scheduler_prefetch_suppress_window(const PTO2TaskSlotState &slot_state) const {
+    if (slot_state.payload == nullptr) {
+        return prefetch_suppress_window_;
+    }
+    const PrefetchFeatureTier tier = classify_prefetch_features(*slot_state.payload);
+    return prefetch_suppress_window_ >= tier.min_suppress_window ? prefetch_suppress_window_ :
+                                                                  tier.min_suppress_window;
+}
+
+int SchedulerContext::get_scheduler_prefetch_channel_idx(int channel_idx) {
+    if (channel_idx < 0) {
+        return channel_idx;
+    }
+    uint32_t channel_count = aicpu_prefetch_channel_count();
+    if (channel_count == 0) {
+        return channel_idx;
+    }
+    return channel_idx % static_cast<int>(channel_count);
+}
+
+bool SchedulerContext::should_attempt_task_prefetch(const PTO2TaskSlotState &slot_state, int channel_idx) const {
+    if (prefetch_debug_enabled_) {
+        prefetch_considered_count_.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (prefetch_mode_ != Runtime::PREFETCH_MODE_SDMA) {
+        if (prefetch_debug_enabled_) {
+            prefetch_skip_not_sdma_.fetch_add(1, std::memory_order_relaxed);
+        }
+        return false;
+    }
+    if (!aicpu_prefetch_available()) {
+        if (prefetch_debug_enabled_) {
+            prefetch_skip_not_available_.fetch_add(1, std::memory_order_relaxed);
+        }
+        return false;
+    }
+    if (slot_state.payload == nullptr) {
+        if (prefetch_debug_enabled_) {
+            prefetch_skip_null_payload_.fetch_add(1, std::memory_order_relaxed);
+        }
+        return false;
+    }
+    if (!slot_state.active_mask.subtask_active(PTO2SubtaskSlot::AIC)) {
+        if (prefetch_debug_enabled_) {
+            prefetch_skip_no_valid_tensor_.fetch_add(1, std::memory_order_relaxed);
+        }
+        return false;
+    }
+    const PTO2TaskPayload &payload = *slot_state.payload;
+    if (payload.prefetch_addr == 0 || payload.prefetch_issue_bytes == 0 || payload.prefetch_filter_bytes == 0) {
+        if (prefetch_debug_enabled_) {
+            prefetch_skip_no_valid_tensor_.fetch_add(1, std::memory_order_relaxed);
+        }
+        return false;
+    }
+    if (payload.prefetch_filter_bytes < prefetch_min_bytes_) {
+        if (prefetch_debug_enabled_) {
+            prefetch_skip_below_min_bytes_.fetch_add(1, std::memory_order_relaxed);
+        }
+        return false;
+    }
+
+    int suppress_channel_idx = get_scheduler_prefetch_channel_idx(channel_idx);
+    uint32_t scheduler_suppress_window = get_scheduler_prefetch_suppress_window(slot_state);
+    if (scheduler_suppress_window > 0 && suppress_channel_idx >= 0 && suppress_channel_idx < RUNTIME_MAX_WORKER) {
+        while (true) {
+            uint32_t remaining =
+                prefetch_scheduler_suppress_remaining_[suppress_channel_idx].load(std::memory_order_relaxed);
+            if (remaining == 0) {
+                break;
+            }
+            uint32_t desired = remaining - 1;
+            if (prefetch_scheduler_suppress_remaining_[suppress_channel_idx].compare_exchange_weak(
+                    remaining, desired, std::memory_order_acq_rel, std::memory_order_relaxed
+                )) {
+                if (prefetch_debug_enabled_) {
+                    prefetch_skip_scheduler_suppressed_.fetch_add(1, std::memory_order_relaxed);
+                }
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+void SchedulerContext::issue_task_prefetch(const PTO2TaskSlotState &slot_state, int channel_idx) const {
+    uint64_t start_cycle = prefetch_debug_enabled_ ? get_sys_cnt_aicpu() : 0;
+    bool eligible_task = false;
+    do {
+        PTO2TaskPayload *payload = slot_state.payload;
+        if (payload == nullptr) {
+            break;
+        }
+        const PTO2TaskPayload &p = *payload;
+        const PrefetchFeatureTier feature_tier = classify_prefetch_features(p);
+        eligible_task = true;
+        if (!aicpu_prefetch_reserve_channel(channel_idx)) {
+            break;
+        }
+
+        void *instr_ptr = nullptr;
+        size_t instr_size = 0;
+        int32_t instr_kernel_id = INVALID_KERNEL_ID;
+        if (slot_state.active_mask.subtask_active(PTO2SubtaskSlot::AIC) && slot_state.task != nullptr) {
+            int32_t kid = slot_state.task->kernel_id[static_cast<int>(PTO2SubtaskSlot::AIC)];
+            if (kid != INVALID_KERNEL_ID) {
+                if (!feature_tier.enable_instr) {
+                    if (prefetch_debug_enabled_) {
+                        prefetch_skip_instr_feature_disabled_.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    payload->instr_prefetch_addr = 0;
+                } else if (kid >= 0 && kid < RUNTIME_MAX_FUNC_ID &&
+                           prefetch_instr_kernel_seen_[kid].load(std::memory_order_relaxed) != 0) {
+                    if (prefetch_debug_enabled_) {
+                        prefetch_skip_instr_kernel_scheduler_.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    payload->instr_prefetch_addr = 0;
+                } else {
+                    uint64_t callable_addr = get_function_bin_addr(kid);
+                    if (callable_addr != 0) {
+                        const auto *callable = reinterpret_cast<const CoreCallable *>(callable_addr);
+                        const uint64_t resolved = callable->resolved_addr();
+                        if (resolved != 0) {
+                            const uint32_t bin = callable->binary_size();
+                            if (bin > 0) {
+                                const uint32_t cap = feature_tier.instr_cap_bytes;
+                                const uint32_t n = (bin < cap) ? bin : cap;
+                                payload->instr_prefetch_addr = resolved;
+                                instr_kernel_id = kid;
+                                instr_ptr = reinterpret_cast<void *>(resolved);
+                                instr_size = static_cast<size_t>(n);
+                            } else {
+                                payload->instr_prefetch_addr = 0;
+                            }
+                        } else {
+                            payload->instr_prefetch_addr = 0;
+                        }
+                    } else {
+                        payload->instr_prefetch_addr = 0;
+                    }
+                }
+            } else {
+                payload->instr_prefetch_addr = 0;
+            }
+        } else {
+            payload->instr_prefetch_addr = 0;
+        }
+
+        if (prefetch_debug_enabled_) {
+            prefetch_task_count_.fetch_add(1, std::memory_order_relaxed);
+            prefetch_tensor_count_.fetch_add(1, std::memory_order_relaxed);
+            prefetch_total_bytes_.fetch_add(p.prefetch_issue_bytes, std::memory_order_relaxed);
+            if (instr_ptr != nullptr) {
+                prefetch_total_bytes_.fetch_add(static_cast<uint64_t>(instr_size), std::memory_order_relaxed);
+            }
+        }
+        aicpu_prefetch_issue_reserved(
+            reinterpret_cast<void *>(p.prefetch_addr), static_cast<size_t>(p.prefetch_issue_bytes), instr_ptr,
+            instr_size, instr_kernel_id, channel_idx
+        );
+        if (instr_kernel_id >= 0 && instr_kernel_id < RUNTIME_MAX_FUNC_ID && instr_ptr != nullptr) {
+            prefetch_instr_kernel_seen_[instr_kernel_id].store(1, std::memory_order_relaxed);
+        }
+    } while (false);
+
+    if (prefetch_debug_enabled_) {
+        uint64_t elapsed = get_sys_cnt_aicpu() - start_cycle;
+        prefetch_control_cycles_.fetch_add(elapsed, std::memory_order_relaxed);
+        if (eligible_task) {
+            prefetch_eligible_control_cycles_.fetch_add(elapsed, std::memory_order_relaxed);
+        }
+    }
+}
+
+PTO2TaskSlotState *SchedulerContext::select_next_task_prefetch_target(
+    PTO2TaskSlotState *const *batch, int got, int bi
+) {
+    for (int next = bi + 1; next < got; ++next) {
+        if (batch[next] != nullptr) {
+            return batch[next];
+        }
+    }
+    return nullptr;
+}
+
+void SchedulerContext::maybe_prefetch_next_task(
+    int32_t thread_idx, PTO2ResourceShape shape, CoreTracker::DispatchPhase phase, CoreTracker &tracker,
+    PTO2TaskSlotState *const *batch, int got, int bi, CoreTracker::BitStates candidate_cores
+) {
+    (void)thread_idx;
+    if (phase != CoreTracker::DispatchPhase::IDLE) {
+        return;
+    }
+    PTO2TaskSlotState *prefetch_target = select_next_task_prefetch_target(batch, got, bi);
+    if (prefetch_target == nullptr) {
+        return;
+    }
+    if (!candidate_cores.has_value()) {
+        candidate_cores = tracker.get_dispatchable_cores(shape, phase);
+    }
+    if (!candidate_cores.has_value()) {
+        return;
+    }
+    int core_offset = candidate_cores.pop_first();
+    if (core_offset < 0) {
+        return;
+    }
+    int prefetch_core_id = tracker.get_core_id_by_offset(core_offset);
+    if (prefetch_core_id < 0 || !should_attempt_task_prefetch(*prefetch_target, prefetch_core_id)) {
+        return;
+    }
+    issue_task_prefetch(*prefetch_target, prefetch_core_id);
+    int suppress_channel_idx = get_scheduler_prefetch_channel_idx(prefetch_core_id);
+    uint32_t scheduler_suppress_window = get_scheduler_prefetch_suppress_window(*prefetch_target);
+    if (scheduler_suppress_window > 0 && suppress_channel_idx >= 0 && suppress_channel_idx < RUNTIME_MAX_WORKER) {
+        prefetch_scheduler_suppress_remaining_[suppress_channel_idx].store(
+            scheduler_suppress_window, std::memory_order_release
+        );
+    }
 }
 
 void SchedulerContext::build_payload(
@@ -314,6 +581,9 @@ void SchedulerContext::dispatch_shape(
             for (int32_t b = 0; b < claim; b++) {
                 auto core_offset = cores.pop_first();
                 dispatch_block(thread_idx, core_offset, *slot_state, shape, is_pending, start + b);
+                if (start + b == 0) {
+                    maybe_prefetch_next_task(thread_idx, shape, phase, tracker, batch, got, bi, cores);
+                }
             }
             made_progress = true;
 #if PTO2_SCHED_PROFILING

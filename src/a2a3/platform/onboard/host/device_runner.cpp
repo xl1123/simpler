@@ -17,6 +17,8 @@
 
 #include "device_runner.h"
 
+#include "host/host_prefetch_setup.h"
+
 #include "host_log.h"
 
 #include <dlfcn.h>
@@ -602,6 +604,13 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     runtime.worker_count = num_aicore;
     worker_count_ = num_aicore;  // Store for print_handshake_results in destructor
     runtime.aicpu_thread_num = launch_aicpu_num;
+    runtime.sdma_prefetch_workspace = host_prefetch_setup(num_aicore);
+    auto prefetch_workspace_cleanup = RAIIScopeGuard([&runtime]() {
+        if (runtime.sdma_prefetch_workspace != nullptr) {
+            host_prefetch_teardown(runtime.sdma_prefetch_workspace);
+            runtime.sdma_prefetch_workspace = nullptr;
+        }
+    });
 
     // Scope guards for register-address cleanup on all exit paths. Declared
     // before the allocs so that an alloc-failure early-return still triggers
@@ -890,6 +899,7 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     // Print handshake results (reads from device memory, must be before free)
     print_handshake_results();
 
+    prefetch_workspace_cleanup.dismiss();
     return 0;
 }
 

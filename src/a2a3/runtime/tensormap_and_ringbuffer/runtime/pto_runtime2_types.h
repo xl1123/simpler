@@ -122,7 +122,7 @@
 #define PTO2_WRIRING_QUEUE_SIZE 1024  // Per-shape queue size
 
 // Fanin storage
-#define PTO2_FANIN_INLINE_CAP 64
+#define PTO2_FANIN_INLINE_CAP 60
 
 // TensorMap cleanup interval
 #define PTO2_TENSORMAP_CLEANUP_INTERVAL 64  // Cleanup every N retired tasks
@@ -243,6 +243,10 @@ struct PTO2TaskPayload {
     int32_t fanin_spill_start{0};   // Linear start index in fanin spill pool (0 = no spill)
     PTO2FaninPool *fanin_spill_pool{nullptr};
     PTO2TaskSlotState *fanin_inline_slot_states[PTO2_FANIN_INLINE_CAP];
+    uint64_t prefetch_addr{0};
+    uint64_t prefetch_issue_bytes{0};
+    uint64_t prefetch_filter_bytes{0};
+    uint64_t instr_prefetch_addr{0};
     // === Cache lines 9-40 (2048B) — tensors (alignas(64) forces alignment) ===
     Tensor tensors[MAX_TENSOR_ARGS];
     // === Cache lines 41-44 (256B) — scalars ===
@@ -265,6 +269,10 @@ struct PTO2TaskPayload {
     void init(const Arg &args, TaskOutputTensors &result, PTO2TaskAllocResult &alloc_result, PTO2OutputLayout &layout) {
         tensor_count = args.tensor_count();
         scalar_count = args.scalar_count();
+        prefetch_addr = 0;
+        prefetch_issue_bytes = 0;
+        prefetch_filter_bytes = 0;
+        instr_prefetch_addr = 0;
 
         // int32_t out_idx = 0;
         for (int32_t i = 0; i < args.tensor_count(); i++) {
@@ -283,6 +291,142 @@ struct PTO2TaskPayload {
         // Round up to cache line boundary. Both arrays are 1024B so no overrun.
         // Eliminates branches; extra bytes within the same CL have zero additional cost.
         memcpy(scalars, args.scalars(), PTO2_ALIGN_UP(args.scalar_count() * sizeof(uint64_t), 64));
+        init_prefetch_metadata(args);
+    }
+
+    static uint64_t tensor_view_nbytes(const Tensor &tensor) {
+        if (tensor.buffer.addr == 0 || tensor.ndims == 0) {
+            return 0;
+        }
+        return tensor.numel() * get_element_size(tensor.dtype);
+    }
+
+    static uint64_t tensor_view_addr(const Tensor &tensor) {
+        return tensor.buffer.addr + tensor.start_offset * static_cast<uint64_t>(get_element_size(tensor.dtype));
+    }
+
+    static bool is_readable_tensor_arg(TensorArgType tag) {
+        return tag == TensorArgType::INPUT || tag == TensorArgType::INOUT || tag == TensorArgType::NO_DEP;
+    }
+
+    bool init_paged_attention_prefetch_metadata() {
+        if (tensor_count != 4) {
+            return false;
+        }
+        const Tensor &cache = tensors[1];
+        const Tensor &block_table = tensors[2];
+        if (cache.buffer.addr == 0 || cache.ndims != 2 || cache.shapes[1] == 0 || block_table.dtype != DataType::INT32) {
+            return false;
+        }
+
+        const uint64_t head_dim = static_cast<uint64_t>(cache.shapes[1]);
+        const uint64_t elem_size = static_cast<uint64_t>(get_element_size(cache.dtype));
+        const int32_t *bt = reinterpret_cast<const int32_t *>(tensor_view_addr(block_table));
+        if (bt == nullptr) {
+            return false;
+        }
+
+        uint64_t block_size = 0;
+        uint64_t logical_blocks = 0;
+        uint64_t bt_index = 0;
+
+        if (scalar_count == 2) {
+            const uint64_t n_blocks = scalars[0];
+            const uint64_t bt_offset = scalars[1];
+            if (n_blocks == 0) {
+                return false;
+            }
+            const Tensor &tensor0 = tensors[0];
+            const Tensor &tensor3 = tensors[3];
+            if (tensor3.ndims == 2 && tensor3.shapes[1] > 0 && tensor3.shapes[1] % n_blocks == 0) {
+                block_size = tensor3.shapes[1] / n_blocks;
+            } else if (tensor0.ndims == 2 && tensor0.shapes[1] > 0 && tensor0.shapes[1] % n_blocks == 0) {
+                block_size = tensor0.shapes[1] / n_blocks;
+            } else {
+                return false;
+            }
+            logical_blocks = n_blocks;
+            bt_index = bt_offset;
+        } else if (scalar_count == 6) {
+            const uint64_t batch_count = scalars[0];
+            const uint64_t block_idx = scalars[1];
+            const uint64_t block_num = scalars[3];
+            const uint64_t batch_start = scalars[5];
+            const Tensor &tensor3 = tensors[3];
+            if (batch_count == 0 || block_num == 0 || tensor3.ndims != 2 || tensor3.shapes[1] == 0) {
+                return false;
+            }
+            block_size = tensor3.shapes[1];
+            logical_blocks = batch_count;
+            bt_index = batch_start * block_num + block_idx;
+        } else if (scalar_count == 4) {
+            const uint64_t batch_count = scalars[0];
+            const uint64_t block_idx = scalars[1];
+            const uint64_t block_num = scalars[2];
+            const uint64_t batch_start = scalars[3];
+            const Tensor &tensor0 = tensors[0];
+            if (batch_count == 0 || block_num == 0 || tensor0.ndims != 2 || tensor0.shapes[1] == 0) {
+                return false;
+            }
+            block_size = tensor0.shapes[1];
+            logical_blocks = batch_count;
+            bt_index = batch_start * block_num + block_idx;
+        } else {
+            return false;
+        }
+
+        if (block_size == 0 || logical_blocks == 0) {
+            return false;
+        }
+
+        int32_t phys_block = bt[bt_index];
+        if (phys_block < 0) {
+            return false;
+        }
+
+        const uint64_t issue_bytes = block_size * head_dim * elem_size;
+        prefetch_addr = tensor_view_addr(cache) + static_cast<uint64_t>(phys_block) * issue_bytes;
+        prefetch_issue_bytes = issue_bytes;
+        prefetch_filter_bytes = logical_blocks * issue_bytes;
+        return prefetch_addr != 0 && prefetch_issue_bytes > 0 && prefetch_filter_bytes >= prefetch_issue_bytes;
+    }
+
+    void init_generic_prefetch_metadata(const Arg &args) {
+        const Tensor *best_tensor = nullptr;
+        uint64_t best_bytes = 0;
+        uint64_t total_readable_bytes = 0;
+
+        for (int32_t i = 0; i < tensor_count; ++i) {
+            TensorArgType tag = args.tag(i);
+            if (!is_readable_tensor_arg(tag)) {
+                continue;
+            }
+            const Tensor &tensor = tensors[i];
+            uint64_t view_bytes = tensor_view_nbytes(tensor);
+            if (view_bytes == 0) {
+                continue;
+            }
+            total_readable_bytes += view_bytes;
+            if (best_tensor == nullptr || view_bytes > best_bytes) {
+                best_tensor = &tensor;
+                best_bytes = view_bytes;
+            }
+        }
+
+        if (best_tensor == nullptr || best_bytes == 0) {
+            return;
+        }
+
+        prefetch_addr = tensor_view_addr(*best_tensor);
+        prefetch_issue_bytes = best_bytes;
+        prefetch_filter_bytes = total_readable_bytes;
+    }
+
+    void init_prefetch_metadata(const Arg &args) {
+        if (init_paged_attention_prefetch_metadata()) {
+            return;
+        }
+        init_generic_prefetch_metadata(args);
     }
 };
 
@@ -291,6 +435,7 @@ static_assert(offsetof(PTO2TaskPayload, fanin_spill_pool) == 16, "spill pool poi
 static_assert(
     offsetof(PTO2TaskPayload, fanin_inline_slot_states) == 24, "inline fanin array must follow spill metadata"
 );
+static_assert(offsetof(PTO2TaskPayload, prefetch_addr) == 504, "prefetch metadata must follow inline fanin");
 static_assert(offsetof(PTO2TaskPayload, tensors) == 576, "tensors must start at byte 576 (cache line 9)");
 static_assert(
     offsetof(PTO2TaskPayload, scalars) == 576 + MAX_TENSOR_ARGS * sizeof(Tensor),

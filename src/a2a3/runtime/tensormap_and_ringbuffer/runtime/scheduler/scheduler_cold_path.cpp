@@ -14,6 +14,7 @@
 #include <cstdio>
 
 #include "common/unified_log.h"
+#include "aicpu/device_prefetch.h"
 #include "aicpu/device_time.h"
 #include "aicpu/l2_perf_collector_aicpu.h"
 #include "aicpu/platform_regs.h"
@@ -868,10 +869,79 @@ int32_t SchedulerContext::init(
 
     func_id_to_addr_ = runtime->func_id_to_addr_;
 
+    prefetch_mode_ = runtime->prefetch_mode;
+    prefetch_min_bytes_ = static_cast<size_t>(runtime->sdma_prefetch_min_bytes);
+    prefetch_suppress_window_ = runtime->sdma_prefetch_suppress_window;
+    prefetch_debug_enabled_ = runtime->sdma_prefetch_debug;
+    prefetch_considered_count_.store(0, std::memory_order_relaxed);
+    prefetch_task_count_.store(0, std::memory_order_relaxed);
+    prefetch_tensor_count_.store(0, std::memory_order_relaxed);
+    prefetch_total_bytes_.store(0, std::memory_order_relaxed);
+    prefetch_skip_not_sdma_.store(0, std::memory_order_relaxed);
+    prefetch_skip_not_available_.store(0, std::memory_order_relaxed);
+    prefetch_skip_null_payload_.store(0, std::memory_order_relaxed);
+    prefetch_skip_below_min_bytes_.store(0, std::memory_order_relaxed);
+    prefetch_skip_no_valid_tensor_.store(0, std::memory_order_relaxed);
+    prefetch_skip_scheduler_suppressed_.store(0, std::memory_order_relaxed);
+    prefetch_skip_instr_kernel_scheduler_.store(0, std::memory_order_relaxed);
+    prefetch_skip_instr_feature_disabled_.store(0, std::memory_order_relaxed);
+    prefetch_control_cycles_.store(0, std::memory_order_relaxed);
+    prefetch_eligible_control_cycles_.store(0, std::memory_order_relaxed);
+    for (int i = 0; i < RUNTIME_MAX_WORKER; ++i) {
+        prefetch_scheduler_suppress_remaining_[i].store(0, std::memory_order_relaxed);
+    }
+    for (int i = 0; i < RUNTIME_MAX_FUNC_ID; ++i) {
+        prefetch_instr_kernel_seen_[i].store(0, std::memory_order_relaxed);
+    }
+    aicpu_prefetch_init(runtime->sdma_prefetch_workspace, prefetch_suppress_window_, prefetch_debug_enabled_);
+    const char *prefetch_mode_name = prefetch_mode_ == Runtime::PREFETCH_MODE_BASELINE ? "baseline" :
+                                     prefetch_mode_ == Runtime::PREFETCH_MODE_TWOSLOT ? "twoslot" :
+                                     prefetch_mode_ == Runtime::PREFETCH_MODE_SDMA ? "sdma" :
+                                                                                     "sdma_fake";
+    LOG_INFO_V0("Prefetch mode: %s", prefetch_mode_name);
+
     return 0;
 }
 
 void SchedulerContext::deinit() {
+    const char *prefetch_mode_name = prefetch_mode_ == Runtime::PREFETCH_MODE_BASELINE ? "baseline" :
+                                     prefetch_mode_ == Runtime::PREFETCH_MODE_TWOSLOT ? "twoslot" :
+                                     prefetch_mode_ == Runtime::PREFETCH_MODE_SDMA ? "sdma" :
+                                                                                     "sdma_fake";
+    uint64_t considered_count = prefetch_considered_count_.load(std::memory_order_relaxed);
+    uint64_t task_count = prefetch_task_count_.load(std::memory_order_relaxed);
+    uint64_t tensor_count = prefetch_tensor_count_.load(std::memory_order_relaxed);
+    uint64_t total_bytes = prefetch_total_bytes_.load(std::memory_order_relaxed);
+    uint64_t skip_not_sdma = prefetch_skip_not_sdma_.load(std::memory_order_relaxed);
+    uint64_t skip_not_available = prefetch_skip_not_available_.load(std::memory_order_relaxed);
+    uint64_t skip_null_payload = prefetch_skip_null_payload_.load(std::memory_order_relaxed);
+    uint64_t skip_below_min_bytes = prefetch_skip_below_min_bytes_.load(std::memory_order_relaxed);
+    uint64_t skip_no_valid_tensor = prefetch_skip_no_valid_tensor_.load(std::memory_order_relaxed);
+    uint64_t skip_scheduler_suppressed = prefetch_skip_scheduler_suppressed_.load(std::memory_order_relaxed);
+    uint64_t skip_instr_kernel_scheduler = prefetch_skip_instr_kernel_scheduler_.load(std::memory_order_relaxed);
+    uint64_t skip_instr_feature_disabled = prefetch_skip_instr_feature_disabled_.load(std::memory_order_relaxed);
+    uint64_t control_cycles = prefetch_control_cycles_.load(std::memory_order_relaxed);
+    uint64_t eligible_control_cycles = prefetch_eligible_control_cycles_.load(std::memory_order_relaxed);
+    LOG_INFO_V0(
+        "Prefetch control path summary: mode=%s considered=%" PRIu64 " eligible_tasks=%" PRIu64
+        " total=%.3fus avg=%.3fus eligible_total=%.3fus eligible_avg=%.3fus",
+        prefetch_mode_name, considered_count, task_count, cycles_to_us(control_cycles),
+        considered_count > 0 ? cycles_to_us(control_cycles) / considered_count : 0.0,
+        cycles_to_us(eligible_control_cycles),
+        task_count > 0 ? cycles_to_us(eligible_control_cycles) / task_count : 0.0
+    );
+    LOG_INFO_V0(
+        "Prefetch task summary: mode=%s considered=%" PRIu64 " eligible_tasks=%" PRIu64 " tensors=%" PRIu64
+        " bytes=%" PRIu64 " min_bytes=%zu skip_not_sdma=%" PRIu64 " skip_not_available=%" PRIu64
+        " skip_null_payload=%" PRIu64 " skip_below_min_bytes=%" PRIu64
+        " skip_no_valid_tensor=%" PRIu64 " skip_scheduler_suppressed=%" PRIu64
+        " skip_instr_kernel_scheduler=%" PRIu64 " skip_instr_feature_disabled=%" PRIu64,
+        prefetch_mode_name, considered_count, task_count, tensor_count, total_bytes, prefetch_min_bytes_, skip_not_sdma,
+        skip_not_available, skip_null_payload, skip_below_min_bytes, skip_no_valid_tensor, skip_scheduler_suppressed,
+        skip_instr_kernel_scheduler, skip_instr_feature_disabled
+    );
+    aicpu_prefetch_deinit();
+
     // Reset all per-core execution state
     for (int32_t i = 0; i < RUNTIME_MAX_WORKER; i++) {
         core_exec_states_[i] = {};
@@ -916,6 +986,30 @@ void SchedulerContext::deinit() {
     }
 
     regs_ = 0;
+    prefetch_mode_ = 0;
+    prefetch_min_bytes_ = 0;
+    prefetch_suppress_window_ = 0;
+    prefetch_debug_enabled_ = false;
+    prefetch_considered_count_.store(0, std::memory_order_relaxed);
+    prefetch_task_count_.store(0, std::memory_order_relaxed);
+    prefetch_tensor_count_.store(0, std::memory_order_relaxed);
+    prefetch_total_bytes_.store(0, std::memory_order_relaxed);
+    prefetch_skip_not_sdma_.store(0, std::memory_order_relaxed);
+    prefetch_skip_not_available_.store(0, std::memory_order_relaxed);
+    prefetch_skip_null_payload_.store(0, std::memory_order_relaxed);
+    prefetch_skip_below_min_bytes_.store(0, std::memory_order_relaxed);
+    prefetch_skip_no_valid_tensor_.store(0, std::memory_order_relaxed);
+    prefetch_skip_scheduler_suppressed_.store(0, std::memory_order_relaxed);
+    prefetch_skip_instr_kernel_scheduler_.store(0, std::memory_order_relaxed);
+    prefetch_skip_instr_feature_disabled_.store(0, std::memory_order_relaxed);
+    prefetch_control_cycles_.store(0, std::memory_order_relaxed);
+    prefetch_eligible_control_cycles_.store(0, std::memory_order_relaxed);
+    for (int i = 0; i < RUNTIME_MAX_WORKER; ++i) {
+        prefetch_scheduler_suppress_remaining_[i].store(0, std::memory_order_relaxed);
+    }
+    for (int i = 0; i < RUNTIME_MAX_FUNC_ID; ++i) {
+        prefetch_instr_kernel_seen_[i].store(0, std::memory_order_relaxed);
+    }
     sched_ = nullptr;
     rt_ = nullptr;
     func_id_to_addr_ = nullptr;

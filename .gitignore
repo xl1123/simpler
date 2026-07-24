@@ -44,3 +44,7 @@ python/_task_interface*.dylib
 # Log files
 *.log
 profiling_logs_*/
+
+# Machine-local MPI L4 sidecar topology
+tools/mpi_l4_sidecar/topology.local.json
+tools/mpi_l4_sidecar/topology.2host.json

@@ -20,6 +20,7 @@ dependencies = ["cloudpickle>=2.2"]
 [project.scripts]
 simpler-remote-worker = "simpler.remote_l3_worker:main"
 simpler-remote-l3-session = "simpler.remote_l3_session:main"
+simpler-remote-l3-sidecar-proxy = "simpler.remote_l3_sidecar_proxy:main"
 
 [project.optional-dependencies]
 # ``torch>=2.3`` is required by ``simpler_setup.torch_interop`` (uses

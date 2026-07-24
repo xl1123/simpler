@@ -7,6 +7,13 @@ End-user profiling / debug CLIs live in
 [`simpler_setup/tools/`](../simpler_setup/tools/) and ship with the wheel —
 invoke them via `python -m simpler_setup.tools.<name>`.
 
+## mpi_l4_sidecar/
+
+Build and launch the optional MPI control-plane path integrated into L4's
+`RemoteL3Endpoint`. The validation runs the same real L4 -> L3 -> L2 sim case
+over legacy TCP and MPI sidecar, then compares results. See
+[`mpi_l4_sidecar/README.md`](./mpi_l4_sidecar/README.md).
+
 ## benchmark_rounds.sh
 
 Batch-run a predefined set of ST examples on hardware, parse `orch_start` /

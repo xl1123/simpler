@@ -77,7 +77,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from multiprocessing.shared_memory import SharedMemory
-from typing import Any, cast
+from typing import Any, Union, cast
 
 import cloudpickle
 from _task_interface import (  # pyright: ignore[reportMissingImports]
@@ -380,6 +380,9 @@ class RemoteWorkerSpec:
     transport: str = "sim"
     session_listen_host: str | None = None
     allow_wildcard_session_bind: bool = False
+    control_transport: str = "socket"
+    sidecar_endpoint: str | None = None
+    mpi_rank: int | None = None
 
     def __post_init__(self) -> None:
         if not self.endpoint:
@@ -392,16 +395,37 @@ class RemoteWorkerSpec:
         object.__setattr__(self, "platform", str(self.platform))
         object.__setattr__(self, "runtime", str(self.runtime))
         object.__setattr__(self, "transport", str(self.transport))
+        object.__setattr__(self, "control_transport", str(self.control_transport))
         object.__setattr__(
             self,
             "session_listen_host",
             None if self.session_listen_host is None else str(self.session_listen_host),
         )
+        object.__setattr__(
+            self,
+            "sidecar_endpoint",
+            None if self.sidecar_endpoint is None else str(self.sidecar_endpoint),
+        )
+        object.__setattr__(self, "mpi_rank", None if self.mpi_rank is None else int(self.mpi_rank))
         object.__setattr__(self, "allow_wildcard_session_bind", bool(self.allow_wildcard_session_bind))
         object.__setattr__(self, "device_ids", tuple(int(x) for x in self.device_ids))
         object.__setattr__(self, "num_sub_workers", int(self.num_sub_workers))
         if self.num_sub_workers < 0:
             raise ValueError("RemoteWorkerSpec.num_sub_workers must be non-negative")
+        if self.control_transport not in ("socket", "mpi_sidecar"):
+            raise ValueError("RemoteWorkerSpec.control_transport must be 'socket' or 'mpi_sidecar'")
+        if self.control_transport == "socket":
+            if self.sidecar_endpoint is not None or self.mpi_rank is not None:
+                raise ValueError("RemoteWorkerSpec socket control transport does not accept sidecar-only fields")
+            return
+        if self.sidecar_endpoint is None:
+            raise ValueError("RemoteWorkerSpec.sidecar_endpoint is required for mpi_sidecar")
+        if not os.path.isabs(self.sidecar_endpoint):
+            raise ValueError("RemoteWorkerSpec.sidecar_endpoint must be an absolute Unix socket path")
+        if "\x00" in self.sidecar_endpoint or len(os.fsencode(self.sidecar_endpoint)) >= 104:
+            raise ValueError("RemoteWorkerSpec.sidecar_endpoint is not a valid portable Unix socket path")
+        if self.mpi_rank is None or self.mpi_rank < 0:
+            raise ValueError("RemoteWorkerSpec.mpi_rank must be non-negative for mpi_sidecar")
 
 
 @dataclass(frozen=True)
@@ -413,6 +437,18 @@ class _RemoteSession:
     health_host: str
     health_port: int
     pid: int
+
+
+@dataclass(frozen=True)
+class _RemoteSidecarSession:
+    worker_id: int
+    session_id: int
+    command_path: str
+    health_path: str
+    pid: int
+
+
+_AnyRemoteSession = Union[_RemoteSession, _RemoteSidecarSession]
 
 
 _IdentitySnapshotEntry = tuple[bytes, Any, int, str, str]
@@ -2058,7 +2094,7 @@ class Worker:
         self._next_level_pids: list[int] = []
         self._remote_worker_specs: list[RemoteWorkerSpec] = []
         self._remote_worker_ids: list[int] = []
-        self._remote_sessions: list[_RemoteSession] = []
+        self._remote_sessions: list[_AnyRemoteSession] = []
         self._next_level_worker_id_count: int = 0
         self._active_remote_slot_refs: list[RemoteBufferHandle] = []
         self._pending_remote_buffer_frees: list[RemoteBufferHandle] = []
@@ -2262,6 +2298,17 @@ class Worker:
         raise OSError(f"remote L3 session connect: no address for {host}:{port}")
 
     @staticmethod
+    def _connect_unix_within_deadline(path: str, deadline: float) -> socket.socket:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.settimeout(Worker._remaining_until(deadline, "remote L3 sidecar connect"))
+            sock.connect(path)
+            return sock
+        except BaseException:
+            sock.close()
+            raise
+
+    @staticmethod
     def _send_remote_daemon_json(sock: socket.socket, payload: dict[str, Any]) -> None:
         data = json.dumps(payload, sort_keys=True).encode("utf-8")
         sock.sendall(struct.pack("<I", len(data)) + data)
@@ -2369,19 +2416,64 @@ class Worker:
             pid=int(reply.get("pid", 0)),
         )
 
-    def _close_remote_session(self, session: _RemoteSession, *, timeout_s: float = 1.0) -> None:
+    def _open_remote_sidecar_session(
+        self, *, spec: RemoteWorkerSpec, worker_id: int, session_id: int, deadline: float
+    ) -> _RemoteSidecarSession:
+        assert spec.sidecar_endpoint is not None
+        assert spec.mpi_rank is not None
+        daemon_host, daemon_port = self._parse_remote_endpoint(spec.endpoint)
+        with self._connect_unix_within_deadline(spec.sidecar_endpoint, deadline) as sock:
+            manifest = self._build_remote_manifest(
+                spec=spec, worker_id=worker_id, session_id=session_id, startup_remaining_s=0.0
+            )
+            manifest["startup_remaining_s"] = self._remaining_until(
+                deadline, "remote L3 sidecar handshake"
+            )
+            request = {
+                "version": 1,
+                "op": "OPEN_SESSION",
+                "target_rank": spec.mpi_rank,
+                "daemon_host": daemon_host,
+                "daemon_port": daemon_port,
+                "manifest": manifest,
+            }
+            sock.settimeout(self._remaining_until(deadline, "remote L3 sidecar handshake"))
+            self._send_remote_daemon_json(sock, request)
+            reply = self._recv_remote_daemon_json(sock, deadline)
+        if not reply.get("ok", False):
+            raise RuntimeError(f"remote L3 sidecar startup failed for worker {worker_id}: {reply.get('error')}")
+        command_path = str(reply["command_path"])
+        health_path = str(reply["health_path"])
+        for name, path in (("command_path", command_path), ("health_path", health_path)):
+            if not os.path.isabs(path) or "\x00" in path or len(os.fsencode(path)) >= 104:
+                raise RuntimeError(f"remote L3 sidecar returned invalid {name}")
+        return _RemoteSidecarSession(
+            worker_id=worker_id,
+            session_id=session_id,
+            command_path=command_path,
+            health_path=health_path,
+            pid=int(reply.get("pid", 0)),
+        )
+
+    def _close_remote_session(self, session: _AnyRemoteSession, *, timeout_s: float = 1.0) -> None:
         """Best-effort protocol shutdown for a remote L3 session."""
 
         from .remote_l3_protocol import FrameHeader, FrameType, send_frame  # noqa: PLC0415
 
         try:
-            with socket.create_connection((session.command_host, session.command_port), timeout=timeout_s) as sock:
+            if isinstance(session, _RemoteSidecarSession):
+                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                sock.settimeout(timeout_s)
+                sock.connect(session.command_path)
+            else:
+                sock = socket.create_connection((session.command_host, session.command_port), timeout=timeout_s)
+            with sock:
                 sock.settimeout(timeout_s)
                 send_frame(sock, FrameHeader(FrameType.SHUTDOWN, session.session_id, session.worker_id, 0))
         except BaseException:  # noqa: BLE001
             pass
 
-    def _close_remote_sessions(self, sessions: list[_RemoteSession]) -> None:
+    def _close_remote_sessions(self, sessions: list[_AnyRemoteSession]) -> None:
         for session in reversed(sessions):
             self._close_remote_session(session)
 
@@ -4065,12 +4157,20 @@ class Worker:
                 session_id = 1
             # The handshake blocks until the remote subtree is READY; the whole
             # open derives its per-op remaining from the shared root deadline.
-            session = self._open_remote_session(
-                spec=spec,
-                worker_id=worker_id,
-                session_id=session_id,
-                deadline=deadline,
-            )
+            if spec.control_transport == "mpi_sidecar":
+                session = self._open_remote_sidecar_session(
+                    spec=spec,
+                    worker_id=worker_id,
+                    session_id=session_id,
+                    deadline=deadline,
+                )
+            else:
+                session = self._open_remote_session(
+                    spec=spec,
+                    worker_id=worker_id,
+                    session_id=session_id,
+                    deadline=deadline,
+                )
             self._remote_sessions.append(session)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -4079,17 +4179,28 @@ class Worker:
             # attach_timeout bounds the command/health connect + HELLO read by the
             # remaining startup budget; runtime_timeout is the full runtime command
             # budget, never clamped by leftover startup time.
-            self._worker.add_remote_l3_socket(
-                session.worker_id,
-                session.session_id,
-                spec.transport,
-                session.command_host,
-                session.command_port,
-                session.health_host,
-                session.health_port,
-                remaining,
-                session_timeout,
-            )
+            if isinstance(session, _RemoteSidecarSession):
+                self._worker.add_remote_l3_sidecar(
+                    session.worker_id,
+                    session.session_id,
+                    spec.transport,
+                    session.command_path,
+                    session.health_path,
+                    remaining,
+                    session_timeout,
+                )
+            else:
+                self._worker.add_remote_l3_socket(
+                    session.worker_id,
+                    session.session_id,
+                    spec.transport,
+                    session.command_host,
+                    session.command_port,
+                    session.health_host,
+                    session.health_port,
+                    remaining,
+                    session_timeout,
+                )
         # Attach may have consumed the last slice of the budget; a final root
         # deadline check keeps a just-over-budget attach from committing READY.
         if time.monotonic() >= deadline:

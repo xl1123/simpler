@@ -14,6 +14,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include <array>
@@ -151,6 +152,41 @@ int make_loopback_listener(uint16_t &port_out) {
     }
     port_out = ntohs(addr.sin_port);
     return listener;
+}
+
+int make_unix_listener(const std::string &path) {
+    int listener = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (listener < 0) throw std::runtime_error(std::string("socket failed: ") + std::strerror(errno));
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    if (path.size() >= sizeof(addr.sun_path)) {
+        ::close(listener);
+        throw std::runtime_error("test Unix socket path is too long");
+    }
+    std::memcpy(addr.sun_path, path.c_str(), path.size() + 1);
+    (void)::unlink(path.c_str());
+    if (::bind(listener, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
+        int err = errno;
+        ::close(listener);
+        throw std::runtime_error(std::string("bind failed: ") + std::strerror(err));
+    }
+    if (::listen(listener, 1) != 0) {
+        int err = errno;
+        ::close(listener);
+        (void)::unlink(path.c_str());
+        throw std::runtime_error(std::string("listen failed: ") + std::strerror(err));
+    }
+    return listener;
+}
+
+void send_bytes(int fd, const std::vector<uint8_t> &bytes) {
+    size_t offset = 0;
+    while (offset < bytes.size()) {
+        ssize_t written = ::send(fd, bytes.data() + offset, bytes.size() - offset, MSG_NOSIGNAL);
+        if (written < 0 && errno == EINTR) continue;
+        if (written <= 0) throw std::runtime_error("test server send failed");
+        offset += static_cast<size_t>(written);
+    }
 }
 
 // Accept one connection and hold it open (sending nothing) until `stop` is set,
@@ -521,6 +557,65 @@ TEST(RemoteSocketTransport, RuntimeWriteToStalledReaderTimesOut) {
     stop.store(true, std::memory_order_release);
     transport.shutdown();
     server_thread.join();
+}
+
+TEST(RemoteSidecarTransport, HelloAndCompletionUseUnixCommandAndHealthLanes) {
+    std::string base = "/tmp/simpler-sidecar-" + std::to_string(::getpid());
+    std::string command_path = base + "-command.sock";
+    std::string health_path = base + "-health.sock";
+    int command_listener = make_unix_listener(command_path);
+    int health_listener = make_unix_listener(health_path);
+
+    std::thread server([=]() {
+        int command_fd = ::accept(command_listener, nullptr, nullptr);
+        remote_l3::HelloPayload hello;
+        hello.session_id = 17;
+        hello.worker_id = 4;
+        hello.comm_profile = "sim";
+        hello.ready_state = remote_l3::ReadyState::READY;
+        remote_l3::FrameHeader hello_header;
+        hello_header.frame_type = remote_l3::FrameType::HELLO;
+        hello_header.session_id = hello.session_id;
+        hello_header.worker_id = hello.worker_id;
+        send_bytes(command_fd, remote_l3::encode_frame(hello_header, remote_l3::encode_hello(hello)));
+
+        int health_fd = ::accept(health_listener, nullptr, nullptr);
+        remote_l3::FrameHeader completion;
+        completion.frame_type = remote_l3::FrameType::COMPLETION;
+        completion.session_id = hello.session_id;
+        completion.worker_id = hello.worker_id;
+        completion.sequence = 9;
+        send_bytes(command_fd, remote_l3::encode_frame(completion, {}));
+
+        std::array<uint8_t, 1> sink{};
+        (void)::recv(health_fd, sink.data(), sink.size(), 0);
+        ::close(health_fd);
+        ::close(command_fd);
+        ::close(health_listener);
+        ::close(command_listener);
+    });
+
+    RemoteL3SidecarTransport transport(command_path, health_path, 2.0, 2.0);
+    EXPECT_NO_THROW(transport.expect_hello_ready(17, 4, "sim"));
+    std::vector<uint8_t> request{0x1};
+    EXPECT_NO_THROW(transport.submit_frame(request));
+    EXPECT_NO_THROW({
+        auto reply = transport.wait_for_reply(remote_l3::FrameType::COMPLETION, 9);
+        EXPECT_FALSE(reply.empty());
+    });
+    transport.shutdown();
+    server.join();
+    (void)::unlink(command_path.c_str());
+    (void)::unlink(health_path.c_str());
+}
+
+TEST(RemoteSidecarTransport, ConstructorValidatesPathsAndTimeoutsBeforeConnect) {
+    EXPECT_THROW(RemoteL3SidecarTransport("", "/tmp/health.sock", 1.0, 1.0), std::invalid_argument);
+    EXPECT_THROW(RemoteL3SidecarTransport("/tmp/command.sock", "", 1.0, 1.0), std::invalid_argument);
+    EXPECT_THROW(RemoteL3SidecarTransport("/tmp/command.sock", "/tmp/health.sock", 0.0, 1.0), std::invalid_argument);
+    EXPECT_THROW(RemoteL3SidecarTransport("/tmp/command.sock", "/tmp/health.sock", 1.0, 0.0), std::invalid_argument);
+    EXPECT_THROW(RemoteL3SidecarTransport(std::string(200, 'x'), "/tmp/health.sock", 1.0, 1.0),
+                 std::invalid_argument);
 }
 
 TEST(RemoteEndpoint, BareHostPointerWithoutSidecarIsEndpointFailure) {

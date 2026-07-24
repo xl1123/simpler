@@ -16,6 +16,7 @@
 #include <netdb.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -320,6 +321,41 @@ int connect_tcp_socket(const std::string &host, uint16_t port, const std::string
     return fd;
 }
 
+int connect_unix_socket(const std::string &path, const std::string &label, Deadline deadline) {
+    if (path.empty()) throw std::invalid_argument(label + ": path must be non-empty");
+    sockaddr_un addr{};
+    if (path.size() >= sizeof(addr.sun_path)) {
+        throw std::invalid_argument(label + ": path exceeds sockaddr_un capacity");
+    }
+    addr.sun_family = AF_UNIX;
+    std::memcpy(addr.sun_path, path.c_str(), path.size() + 1);
+
+    (void)remaining_seconds(deadline, label + ": connect timed out");
+    int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) throw std::runtime_error(label + ": socket failed: " + std::strerror(errno));
+    try {
+        configure_socket_no_sigpipe(fd, label);
+        int flags = ::fcntl(fd, F_GETFL, 0);
+        if (flags < 0 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+            throw std::runtime_error(label + ": fcntl(O_NONBLOCK) failed: " + std::strerror(errno));
+        }
+        int rc = ::connect(fd, reinterpret_cast<const sockaddr *>(&addr), sizeof(addr));
+        if (rc != 0) {
+            if (errno != EINPROGRESS) {
+                throw std::runtime_error(label + ": connect failed: " + std::strerror(errno));
+            }
+            int connect_error = wait_for_connect(fd, deadline, label);
+            if (connect_error != 0) {
+                throw std::runtime_error(label + ": connect failed: " + std::strerror(connect_error));
+            }
+        }
+        return fd;
+    } catch (...) {
+        ::close(fd);
+        throw;
+    }
+}
+
 RemoteAddressSpace decode_remote_address_space(int32_t raw, const char *field_name) {
     switch (static_cast<RemoteAddressSpace>(raw)) {
     case RemoteAddressSpace::HOST_INLINE:
@@ -611,6 +647,232 @@ std::vector<uint8_t> RemoteL3SocketTransport::wait_for_reply(remote_l3::FrameTyp
 }
 
 void RemoteL3SocketTransport::shutdown() { close_socket(); }
+
+RemoteL3SidecarTransport::RemoteL3SidecarTransport(
+    std::string command_path, std::string health_path, double attach_timeout_s, double runtime_timeout_s
+) :
+    command_path_(std::move(command_path)),
+    health_path_(std::move(health_path)),
+    attach_timeout_s_(attach_timeout_s),
+    runtime_timeout_s_(runtime_timeout_s) {
+    if (command_path_.empty()) throw std::invalid_argument("RemoteL3SidecarTransport: command path must be non-empty");
+    if (health_path_.empty()) throw std::invalid_argument("RemoteL3SidecarTransport: health path must be non-empty");
+    if (attach_timeout_s_ <= 0.0)
+        throw std::invalid_argument("RemoteL3SidecarTransport: attach timeout must be positive");
+    if (runtime_timeout_s_ <= 0.0)
+        throw std::invalid_argument("RemoteL3SidecarTransport: runtime timeout must be positive");
+    attach_deadline_ =
+        std::chrono::steady_clock::now() + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                               std::chrono::duration<double>(attach_timeout_s_)
+                                           );
+    connect_socket();
+}
+
+RemoteL3SidecarTransport::~RemoteL3SidecarTransport() { close_socket(); }
+
+void RemoteL3SidecarTransport::connect_socket() {
+    fd_ = connect_unix_socket(command_path_, "RemoteL3SidecarTransport(command)", attach_deadline_);
+}
+
+void RemoteL3SidecarTransport::close_socket() {
+    stop_health_monitor();
+    if (fd_ >= 0) {
+        ::shutdown(fd_, SHUT_RDWR);
+        ::close(fd_);
+        fd_ = -1;
+    }
+}
+
+void RemoteL3SidecarTransport::mark_health_failed(const std::string &message) {
+    std::lock_guard<std::mutex> lk(health_mu_);
+    if (health_failed_.load(std::memory_order_acquire)) return;
+    health_error_ = message;
+    health_failed_.store(true, std::memory_order_release);
+}
+
+void RemoteL3SidecarTransport::check_health() {
+    if (!health_failed_.load(std::memory_order_acquire)) return;
+    std::string message;
+    {
+        std::lock_guard<std::mutex> lk(health_mu_);
+        message = health_error_;
+    }
+    throw std::runtime_error("RemoteL3SidecarTransport: health lane failed: " + message);
+}
+
+void RemoteL3SidecarTransport::start_health_monitor(uint64_t session_id, int32_t worker_id) {
+    if (health_thread_.joinable()) return;
+    health_fd_ = connect_unix_socket(health_path_, "RemoteL3SidecarTransport(health)", attach_deadline_);
+    health_stop_.store(false, std::memory_order_release);
+    health_failed_.store(false, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lk(health_mu_);
+        health_error_.clear();
+    }
+    int fd = health_fd_;
+    double timeout_s = runtime_timeout_s_;
+    health_thread_ = std::thread([this, fd, session_id, worker_id, timeout_s]() {
+        auto read_exact = [&](uint8_t *data, size_t size) -> bool {
+            size_t off = 0;
+            auto deadline = deadline_from_now(timeout_s);
+            while (off < size) {
+                if (health_stop_.load(std::memory_order_acquire)) return false;
+                (void)poll_socket(
+                    fd, POLLIN, deadline, "timed out waiting for sidecar HEALTH frame",
+                    "sidecar health poll failed"
+                );
+                ssize_t n = ::recv(fd, data + off, size - off, 0);
+                if (n < 0) {
+                    if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+                    throw std::runtime_error(std::string("recv failed: ") + std::strerror(errno));
+                }
+                if (n == 0) throw std::runtime_error("health socket closed");
+                off += static_cast<size_t>(n);
+            }
+            return true;
+        };
+
+        try {
+            static constexpr size_t HEADER_BYTES = 40;
+            while (!health_stop_.load(std::memory_order_acquire)) {
+                std::vector<uint8_t> frame(HEADER_BYTES);
+                if (!read_exact(frame.data(), HEADER_BYTES)) return;
+                uint32_t payload_bytes = read_le_u32(frame.data() + 32);
+                if (payload_bytes > remote_l3::MAX_FRAME_PAYLOAD_BYTES) {
+                    throw std::runtime_error("HEALTH payload exceeds maximum");
+                }
+                frame.resize(HEADER_BYTES + payload_bytes);
+                if (payload_bytes != 0 && !read_exact(frame.data() + HEADER_BYTES, payload_bytes)) return;
+                auto decoded = remote_l3::decode_frame(frame);
+                if (decoded.header.frame_type != remote_l3::FrameType::HEALTH) {
+                    throw std::runtime_error("non-HEALTH frame on health lane");
+                }
+                if (decoded.header.session_id != session_id || decoded.header.worker_id != worker_id) {
+                    throw std::runtime_error("HEALTH session or worker mismatch");
+                }
+            }
+        } catch (const std::exception &e) {
+            if (!health_stop_.load(std::memory_order_acquire)) mark_health_failed(e.what());
+        }
+    });
+}
+
+void RemoteL3SidecarTransport::stop_health_monitor() {
+    health_stop_.store(true, std::memory_order_release);
+    if (health_fd_ >= 0) ::shutdown(health_fd_, SHUT_RDWR);
+    if (health_thread_.joinable()) health_thread_.join();
+    if (health_fd_ >= 0) {
+        ::close(health_fd_);
+        health_fd_ = -1;
+    }
+}
+
+void RemoteL3SidecarTransport::wait_readable(std::chrono::steady_clock::time_point deadline) {
+    check_health();
+    (void)poll_socket(
+        fd_, POLLIN, deadline, "RemoteL3SidecarTransport: timed out waiting for frame",
+        "RemoteL3SidecarTransport: poll(read) failed"
+    );
+}
+
+void RemoteL3SidecarTransport::wait_writable(std::chrono::steady_clock::time_point deadline) {
+    check_health();
+    (void)poll_socket(
+        fd_, POLLOUT, deadline, "RemoteL3SidecarTransport: timed out writing frame",
+        "RemoteL3SidecarTransport: poll(write) failed"
+    );
+}
+
+void RemoteL3SidecarTransport::write_all(
+    const uint8_t *data, size_t size, std::chrono::steady_clock::time_point deadline
+) {
+    size_t off = 0;
+    while (off < size) {
+        wait_writable(deadline);
+        ssize_t n = send_no_sigpipe(fd_, data + off, size - off);
+        if (n < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            throw std::runtime_error(std::string("RemoteL3SidecarTransport: send failed: ") + std::strerror(errno));
+        }
+        if (n == 0) throw std::runtime_error("RemoteL3SidecarTransport: socket closed while writing");
+        off += static_cast<size_t>(n);
+    }
+}
+
+std::vector<uint8_t> RemoteL3SidecarTransport::read_frame(std::chrono::steady_clock::time_point deadline) {
+    static constexpr size_t HEADER_BYTES = 40;
+    std::vector<uint8_t> frame(HEADER_BYTES);
+    size_t off = 0;
+    while (off < HEADER_BYTES) {
+        wait_readable(deadline);
+        ssize_t n = ::recv(fd_, frame.data() + off, HEADER_BYTES - off, 0);
+        if (n < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            throw std::runtime_error(
+                std::string("RemoteL3SidecarTransport: recv header failed: ") + std::strerror(errno)
+            );
+        }
+        if (n == 0) throw std::runtime_error("RemoteL3SidecarTransport: socket closed while reading header");
+        off += static_cast<size_t>(n);
+    }
+    uint32_t payload_bytes = read_le_u32(frame.data() + 32);
+    if (payload_bytes > remote_l3::MAX_FRAME_PAYLOAD_BYTES) {
+        throw std::runtime_error("RemoteL3SidecarTransport: frame payload exceeds maximum");
+    }
+    frame.resize(HEADER_BYTES + payload_bytes);
+    off = HEADER_BYTES;
+    while (off < frame.size()) {
+        wait_readable(deadline);
+        ssize_t n = ::recv(fd_, frame.data() + off, frame.size() - off, 0);
+        if (n < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            throw std::runtime_error(
+                std::string("RemoteL3SidecarTransport: recv payload failed: ") + std::strerror(errno)
+            );
+        }
+        if (n == 0) throw std::runtime_error("RemoteL3SidecarTransport: socket closed while reading payload");
+        off += static_cast<size_t>(n);
+    }
+    return frame;
+}
+
+void RemoteL3SidecarTransport::expect_hello_ready(
+    uint64_t session_id, int32_t worker_id, const std::string &comm_profile
+) {
+    auto frame = remote_l3::decode_frame(read_frame(attach_deadline_));
+    if (frame.header.frame_type != remote_l3::FrameType::HELLO) {
+        throw std::runtime_error("RemoteL3SidecarTransport: expected HELLO frame");
+    }
+    auto hello = remote_l3::decode_hello(frame.payload.data(), frame.payload.size());
+    if (hello.session_id != session_id || hello.worker_id != worker_id) {
+        throw std::runtime_error("RemoteL3SidecarTransport: HELLO session or worker mismatch");
+    }
+    if (hello.ready_state != remote_l3::ReadyState::READY) {
+        throw std::runtime_error("RemoteL3SidecarTransport: HELLO did not report READY");
+    }
+    if (hello.comm_profile != comm_profile) {
+        throw std::runtime_error("RemoteL3SidecarTransport: HELLO comm profile mismatch");
+    }
+    start_health_monitor(session_id, worker_id);
+}
+
+void RemoteL3SidecarTransport::submit_frame(const std::vector<uint8_t> &frame) {
+    if (fd_ < 0) throw std::runtime_error("RemoteL3SidecarTransport: socket is closed");
+    write_all(frame.data(), frame.size(), deadline_from_now(runtime_timeout_s_));
+}
+
+std::vector<uint8_t> RemoteL3SidecarTransport::wait_for_reply(
+    remote_l3::FrameType frame_type, uint64_t sequence
+) {
+    auto frame_bytes = read_frame(deadline_from_now(runtime_timeout_s_));
+    auto frame = remote_l3::decode_frame(frame_bytes);
+    if (frame.header.frame_type != frame_type || frame.header.sequence != sequence) {
+        throw std::runtime_error("RemoteL3SidecarTransport: reply frame type or sequence mismatch");
+    }
+    return frame_bytes;
+}
+
+void RemoteL3SidecarTransport::shutdown() { close_socket(); }
 
 RemoteL3Endpoint::RemoteL3Endpoint(
     int32_t worker_id, uint64_t session_id, std::string transport_name, std::unique_ptr<RemoteL3Transport> transport

@@ -412,6 +412,21 @@ inline void bind_worker(nb::module_ &m) {
             nb::arg("health_host"), nb::arg("health_port"), nb::arg("attach_timeout_s") = 30.0,
             nb::arg("runtime_timeout_s") = 30.0, "Register a REMOTE_L3 endpoint after the session reports HELLO READY."
         )
+        .def(
+            "add_remote_l3_sidecar",
+            [](Worker &self, int32_t worker_id, uint64_t session_id, const std::string &transport_name,
+               const std::string &command_path, const std::string &health_path, double attach_timeout_s,
+               double runtime_timeout_s) {
+                nb::gil_scoped_release release;
+                self.add_remote_l3_sidecar(
+                    worker_id, session_id, transport_name, command_path, health_path, attach_timeout_s,
+                    runtime_timeout_s
+                );
+            },
+            nb::arg("worker_id"), nb::arg("session_id"), nb::arg("transport_name"), nb::arg("command_path"),
+            nb::arg("health_path"), nb::arg("attach_timeout_s") = 30.0, nb::arg("runtime_timeout_s") = 30.0,
+            "Register a REMOTE_L3 sidecar endpoint after the session reports HELLO READY."
+        )
 
         // Release the GIL while starting the Scheduler thread so another Python
         // thread can run during it — e.g. a concurrent close() observing

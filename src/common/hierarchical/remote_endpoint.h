@@ -74,6 +74,44 @@ private:
     std::vector<uint8_t> read_frame(std::chrono::steady_clock::time_point deadline);
 };
 
+class RemoteL3SidecarTransport : public RemoteL3Transport {
+public:
+    RemoteL3SidecarTransport(
+        std::string command_path, std::string health_path, double attach_timeout_s, double runtime_timeout_s
+    );
+    ~RemoteL3SidecarTransport() override;
+
+    void expect_hello_ready(uint64_t session_id, int32_t worker_id, const std::string &comm_profile);
+    void submit_frame(const std::vector<uint8_t> &frame) override;
+    std::vector<uint8_t> wait_for_reply(remote_l3::FrameType frame_type, uint64_t sequence) override;
+    void shutdown() override;
+
+private:
+    std::string command_path_;
+    std::string health_path_;
+    double attach_timeout_s_{30.0};
+    double runtime_timeout_s_{30.0};
+    std::chrono::steady_clock::time_point attach_deadline_{};
+    int fd_{-1};
+    int health_fd_{-1};
+    std::thread health_thread_;
+    std::atomic<bool> health_stop_{false};
+    std::atomic<bool> health_failed_{false};
+    std::mutex health_mu_;
+    std::string health_error_;
+
+    void connect_socket();
+    void close_socket();
+    void start_health_monitor(uint64_t session_id, int32_t worker_id);
+    void stop_health_monitor();
+    void mark_health_failed(const std::string &message);
+    void check_health();
+    void wait_readable(std::chrono::steady_clock::time_point deadline);
+    void wait_writable(std::chrono::steady_clock::time_point deadline);
+    void write_all(const uint8_t *data, size_t size, std::chrono::steady_clock::time_point deadline);
+    std::vector<uint8_t> read_frame(std::chrono::steady_clock::time_point deadline);
+};
+
 class RemoteL3Endpoint : public WorkerEndpoint {
 public:
     RemoteL3Endpoint(

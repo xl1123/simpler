@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any
 
 SIDECAR_MAGIC = b"SLM1"
-SIDECAR_VERSION = 1
+SIDECAR_VERSION = 2
 SIDECAR_HEADER = struct.Struct("<4sIIiiQIIQ")
 SIDECAR_MAX_PAYLOAD = 16 * 1024 * 1024
 SLR3_HEADER_BYTES = 40
@@ -45,6 +45,8 @@ class MessageType(enum.IntEnum):
     CLOSE_SESSION = 5
     ERROR = 6
     SHUTDOWN = 7
+    FRAME_L4_TO_L3 = 8
+    FRAME_L3_TO_L4 = 9
 
 
 class Lane(enum.IntEnum):
@@ -318,7 +320,7 @@ class SidecarProxy:
                 if frame_session != session.session_id or worker_id != session.worker_id:
                     raise ValueError("local L4 SLR3 identity differs from sidecar session")
                 self._send_message(
-                    MessageType.FRAME,
+                    MessageType.FRAME_L4_TO_L3,
                     target_rank=session.target_rank,
                     session_id=session.session_id,
                     lane=lane,
@@ -328,7 +330,7 @@ class SidecarProxy:
                 _log_frame(
                     "L4_TO_MPI",
                     Envelope(
-                        MessageType.FRAME,
+                        MessageType.FRAME_L4_TO_L3,
                         self.rank,
                         session.target_rank,
                         session.session_id,
@@ -468,7 +470,7 @@ class SidecarProxy:
                 if frame_session != session.session_id or worker_id != session.worker_id:
                     raise ValueError("remote L3 SLR3 identity differs from sidecar session")
                 self._send_message(
-                    MessageType.FRAME,
+                    MessageType.FRAME_L3_TO_L4,
                     target_rank=session.source_rank,
                     session_id=session.session_id,
                     lane=lane,
@@ -478,7 +480,7 @@ class SidecarProxy:
                 _log_frame(
                     "L3_TO_MPI",
                     Envelope(
-                        MessageType.FRAME,
+                        MessageType.FRAME_L3_TO_L4,
                         self.rank,
                         session.source_rank,
                         session.session_id,
@@ -620,7 +622,17 @@ class SidecarProxy:
             source = self._sources.get(envelope.session_id)
             target = self._targets.get(envelope.session_id)
             closed = envelope.session_id in self._closed_sessions
-        if source is not None and envelope.source_rank == source.target_rank:
+        source_matches = source is not None and envelope.source_rank == source.target_rank
+        target_matches = target is not None and envelope.source_rank == target.source_rank
+        deliver_to_source = envelope.message_type == MessageType.FRAME_L3_TO_L4
+        deliver_to_target = envelope.message_type == MessageType.FRAME_L4_TO_L3
+        if envelope.message_type == MessageType.FRAME:
+            if source_matches == target_matches:
+                raise ValueError("legacy FRAME direction is ambiguous for this session")
+            deliver_to_source = source_matches
+            deliver_to_target = target_matches
+        if deliver_to_source and source_matches:
+            assert source is not None
             if worker_id != source.worker_id:
                 raise ValueError("source session worker_id mismatch")
             _log_frame("MPI_TO_L4", envelope)
@@ -631,7 +643,8 @@ class SidecarProxy:
                     return
                 sock.sendall(envelope.payload)
             return
-        if target is not None and envelope.source_rank == target.source_rank:
+        if deliver_to_target and target_matches:
+            assert target is not None
             if worker_id != target.worker_id:
                 raise ValueError("target session worker_id mismatch")
             _log_frame("MPI_TO_L3", envelope)
@@ -713,7 +726,11 @@ class SidecarProxy:
                 threading.Thread(target=self._open_target, args=(envelope,), daemon=True).start()
             elif envelope.message_type == MessageType.OPEN_SESSION_REPLY:
                 self._handle_open_reply(envelope)
-            elif envelope.message_type == MessageType.FRAME:
+            elif envelope.message_type in (
+                MessageType.FRAME,
+                MessageType.FRAME_L4_TO_L3,
+                MessageType.FRAME_L3_TO_L4,
+            ):
                 self._deliver_frame(envelope)
             elif envelope.message_type == MessageType.CLOSE_SESSION:
                 self._close_session(envelope.session_id, require_runner_exit=True)

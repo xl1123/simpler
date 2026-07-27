@@ -74,7 +74,7 @@ void read_all(int fd, uint8_t *data, size_t size) {
 
 bool valid_type(uint32_t raw) {
     return raw >= static_cast<uint32_t>(MessageType::WORLD_READY) &&
-           raw <= static_cast<uint32_t>(MessageType::SHUTDOWN);
+           raw <= static_cast<uint32_t>(MessageType::FRAME_L3_TO_L4);
 }
 
 bool valid_lane(uint32_t raw) { return raw <= static_cast<uint32_t>(Lane::HEALTH); }

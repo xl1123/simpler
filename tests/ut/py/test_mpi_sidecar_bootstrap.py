@@ -21,6 +21,8 @@ from simpler.remote_l3_sidecar_proxy import (
     Lane,
     MessageType,
     SidecarProxy,
+    _SourceSession,
+    _TargetSession,
     _slr3_identity,
     _worker_ids_for_rank,
     encode_envelope,
@@ -72,6 +74,8 @@ def test_slr3_identity_rejects_payload_length_mismatch():
 
 
 def test_worker_map_requires_rank_and_exact_worker_set():
+    assert _worker_ids_for_rank("0:0;1:1", 0) == {0}
+    assert _worker_ids_for_rank("0:0;1:1", 1) == {1}
     assert _worker_ids_for_rank("0:;1:0,2;2:1", 0) == set()
     assert _worker_ids_for_rank("0:;1:0,2;2:1", 1) == {0, 2}
     with pytest.raises(ValueError, match="no entry"):
@@ -80,6 +84,63 @@ def test_worker_map_requires_rank_and_exact_worker_set():
         _worker_ids_for_rank("0:;0:1", 0)
     with pytest.raises(ValueError, match="duplicate worker"):
         _worker_ids_for_rank("0:1,1", 0)
+
+
+class _RecordingSocket:
+    def __init__(self):
+        self.sent: list[bytes] = []
+
+    def sendall(self, data: bytes) -> None:
+        self.sent.append(data)
+
+    def settimeout(self, _timeout: float | None) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+def test_rank_zero_routes_local_master_and_local_target_by_frame_direction(tmp_path):
+    proxy = SidecarProxy(
+        rank=0,
+        sidecar_socket=str(tmp_path / "proxy.sock"),
+        session_dir=str(tmp_path / "sessions"),
+        worker_ids={0},
+        bootstrap_socket=str(tmp_path / "bootstrap.sock"),
+    )
+    source_socket = _RecordingSocket()
+    target_socket = _RecordingSocket()
+    proxy._sources[11] = _SourceSession(  # type: ignore[arg-type]  # noqa: SLF001
+        11,
+        0,
+        0,
+        str(tmp_path / "source-command.sock"),
+        str(tmp_path / "source-health.sock"),
+        _RecordingSocket(),
+        _RecordingSocket(),
+        sockets={Lane.COMMAND: source_socket},
+    )
+    proxy._targets[11] = _TargetSession(  # type: ignore[arg-type]  # noqa: SLF001
+        11,
+        0,
+        0,
+        0,
+        1.0,
+        {Lane.COMMAND: target_socket},
+    )
+    frame_to_l3 = _frame(session_id=11, worker_id=0, sequence=1)
+    proxy._deliver_frame(  # noqa: SLF001
+        Envelope(MessageType.FRAME_L4_TO_L3, 0, 0, 11, Lane.COMMAND, 1, frame_to_l3)
+    )
+    assert target_socket.sent == [frame_to_l3]
+    assert source_socket.sent == []
+
+    frame_to_l4 = _frame(session_id=11, worker_id=0, sequence=2)
+    proxy._deliver_frame(  # noqa: SLF001
+        Envelope(MessageType.FRAME_L3_TO_L4, 0, 0, 11, Lane.COMMAND, 2, frame_to_l4)
+    )
+    assert source_socket.sent == [frame_to_l4]
+    assert target_socket.sent == [frame_to_l3]
 
 
 def test_multiple_envelopes_keep_stream_boundaries():

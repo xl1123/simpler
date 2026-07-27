@@ -38,13 +38,16 @@ MPI 只进入独立 sidecar 进程，不进入会 fork L2 的 L4/L3 Worker 进�
 通过 UDS 使用 sidecar，因此不要求 `_task_interface` 链接 MPI，也不要求 Worker 使用
 `MPI_THREAD_MULTIPLE`。
 
-基线版本：`simpler` `c032e07e`。
+当前实现基线：`simpler` `d6b73e8c`。第一阶段硬件用例参考
+`l4test` `5d8c1dbe` 的 `tools/remote_l4_npu`，但验证入口直接接入 Simpler 的 L4
+remote worker 和 MPI sidecar，不复制一套独立通信协议。
 
 ## 2. 四项闭环
 
 完整交付需要形成四项闭环：
 
-1. **mpirun 进程闭环**：`mpirun` 在每台参与主机启动一个 MPI sidecar rank，完成
+1. **mpirun 进程闭环**：`mpirun` 在两台机器各启动一个 MPI sidecar rank；机器 A
+   另外运行现有 L4 master（不占 MPI rank），共同完成
    `worker_id -> mpi_rank -> hostname` 校验、就绪和有界退出。
 2. **L4 控制面闭环**：真实 L4 的 bootstrap、HELLO、TASK、CONTROL、COMPLETION、
    HEALTH 和 SHUTDOWN 的跨机段走 MPI P2P。
@@ -84,8 +87,10 @@ RemoteWorkerSpec(
 - `control_transport="socket"` 保持当前 `endpoint="host:port"` 解析、numeric host
   限制、bootstrap、command/health socket 和 timeout 行为。
 - 只有 `control_transport="mpi_sidecar"` 才解析 `sidecar_endpoint` 和 `mpi_rank`。
-- `transport` 继续表示数据/通信 profile，第一、二阶段仍使用 `"sim"`；不能把
-  `control_transport` 和 `transport` 混成同一字段。
+- `transport` 继续表示 remote-buffer 数据/通信 profile，第一阶段真实 NPU 用例仍使用
+  `"sim"`，因为输入输出经 `COPY_TO_REMOTE/COPY_FROM_REMOTE` 搬运；它不表示 L2
+  simulator。真实 L2 由 `platform="a2a3"` 和 `device_ids=(0, 1)` 选择。不能把
+  `control_transport`、buffer transport profile 和 L2 platform 混成同一字段。
 - 不新增环境变量或编译宏作为选择开关。
 - `add_remote_l3_socket()` 和 `RemoteL3SocketTransport` 保留；新增
   `add_remote_l3_sidecar()` 和 `RemoteL3SidecarTransport`。
@@ -108,8 +113,8 @@ MPI sidecar attach 必须遵守当前 `Worker.init()` 契约：
 - L4 继续显式通过 `worker=` 选择远端 L3。
 - `RemoteL3Endpoint` 继续负责 ordered command lane 和 task/control 语义。
 - L3 -> L2 继续使用现有 fork、shm/mailbox、Scheduler 和 ChipWorker ABI。
-- 第一阶段的 MPI 用例必须实际包含一个 L2 sim child，不能只在远端 Python dispatcher
-  返回结果。
+- 第一阶段保留 L2 sim 用例作为无设备快速回归，但硬门禁必须让两个远端 L3 各自调度
+  两个真实 L2 NPU child，不能只在远端 Python dispatcher 返回结果。
 
 ## 4. 第一阶段：直接接入 L4 的最小 MPI 控制闭环
 
@@ -122,12 +127,12 @@ mpirun 启动至少两个 sidecar rank
   -> rank/host/worker 拓扑 READY
   -> L4 Worker.init() 通过本机 UDS bootstrap
   -> 远端 sidecar 请求当前 remote daemon 创建 L3 session
-  -> 远端 L3 完成 L2 sim child init
+  -> 两个远端 L3 各自完成两个真实 L2 NPU child init
   -> HELLO READY 经 MPI 返回 L4
   -> L4 注册 remote callable
   -> L4 向明确 worker_id 提交任务
   -> TASK 经 MPI 到达远端 L3
-  -> 远端 L3 调度 L2 sim child
+  -> 远端 L3 通过 submit_next_level_group 调度真实 L2 NPU
   -> COMPLETION 经 MPI 返回
   -> L4 drain 成功
   -> SHUTDOWN 和所有进程有界退出
@@ -161,6 +166,11 @@ python/bindings/worker_bind.h
 python/simpler/remote_l3_sidecar_proxy.py
   使用 Python 标准库处理本机 UDS、daemon JSON bootstrap 和 session channel
   不执行 MPI，不创建 Worker
+
+python/simpler/remote_l3_session.py
+  真实 platform 的 ALLOC_REMOTE_BUFFER 使用 inner L3 Worker.create_host_buffer()
+  使 RemoteTensorRef materialize 为 L2 child 已映射的 host 地址
+  a2a3sim 和 childless worker 保留 SharedMemory 回退及 EXPORT_BUFFER(sim) 兼容性
 ```
 
 MPI sidecar 是 L4 remote transport 的组成部分，不是独立 smoke。其代码放在 runtime
@@ -174,26 +184,35 @@ src/common/hierarchical/mpi_sidecar/
   README.md
 ```
 
-`tools/mpi_l4_sidecar/` 只允许放启动脚本、hostfile 和本机配置模板，不能放另一套与
-Simpler runtime 无关的 TASK/RemoteBuffer 模拟实现：
+`tools/mpi_l4_sidecar/` 只放构建/启动/验证编排和调用生产 Worker API 的端到端入口，
+不能放另一套与 Simpler runtime 无关的 TASK/RemoteBuffer 协议模拟实现：
 
 ```text
 tools/mpi_l4_sidecar/
   build.sh
+  launch.py
+  npu_e2e_case.py
   run_1host_sim.sh
   run_2host_sim.sh
+  run_2host_npu.sh
   topology.example.json
+  topology.2host-npu.example.json
   verify_no_residue.sh
 ```
 
+`npu_e2e_case.py` 是真实 Simpler runtime 的端到端调用入口：它构造生产
+`Worker(level=4)`、`RemoteWorkerSpec`、动态 `ChipCallable` 注册、RemoteBuffer 和
+`submit_next_level_group()`，不模拟 MPI、SLR3 或 RemoteBuffer 协议。
+
 ### 4.3 Sidecar 进程模型
 
-每台主机一个 MPI rank，一个 rank 可以承载多个 remote worker session：
+硬件门禁只有两台机器和两个 MPI rank。现有 `npu_e2e_case.py` 是 L4 master；master
+运行在机器 A，但不由 `mpirun` 拉起，也不占用第三个 rank：
 
 ```text
-rank 0: L4 主机，worker_ids=[]
-rank 1: L3 主机 A，worker_ids=[0, 1]
-rank 2: L3 主机 B，worker_ids=[2]
+机器 A / rank 0: L4 master + bootstrap/source + worker_ids=[0] -> NPU 0,1
+机器 B / rank 1:                               worker_ids=[1] -> NPU 0,1
+worker_map: 0:0;1:1
 ```
 
 启动流程：
@@ -205,6 +224,10 @@ rank 2: L3 主机 B，worker_ids=[2]
 4. `MPI_Allgather` 校验 rank、hostname、role、worker_id 集合和公共配置摘要。
 5. 所有 rank 拓扑一致后，rank 0 proxy 才发布 bootstrap UDS READY。
 6. L4 `Worker.init()` 连接该 UDS，开始正常 remote session activation。
+
+rank 0 proxy 同时持有 L4 source session 和本机 worker 0 target session。sidecar envelope
+v2 使用 `FRAME_L4_TO_L3` / `FRAME_L3_TO_L4` 显式标识方向，不能再用 source rank 推断，
+因为本机闭环两端的 rank 都是 0。
 
 第一阶段固定采用“launcher 预先启动 proxy”：launcher 必须等待 proxy internal UDS
 READY 后再启动 sidecar，并只按本次唯一 JOB_ID 回收它启动的进程和路径，不依赖竞态重试。
@@ -222,7 +245,7 @@ L4 worker.py
   -> 本机 simpler-remote-worker TCP bootstrap
   -> exec simpler-remote-l3-session
   -> inner Worker(level=3).init()
-  -> L2 sim child INIT_READY
+  -> L2 child INIT_READY（快速门禁为 sim，硬件门禁为两个 a2a3 NPU child）
   -> command/health channel ready
   -> OPEN_SESSION_REPLY 经 MPI 返回
   -> L4 add_remote_l3_sidecar()
@@ -260,11 +283,16 @@ L4 RemoteL3Endpoint
 ```text
 HELLO
 CONTROL: callable prepare/commit/abort/unregister
+CONTROL: ALLOC/FREE_REMOTE_BUFFER、COPY_TO/FROM_REMOTE
 TASK
 COMPLETION
 HEALTH
 SHUTDOWN
 ```
+
+真实 NPU 用例要求上述 RemoteBuffer control 和动态 CHIP_CALLABLE 注册在第一阶段闭环，
+因为 L4 要把输入送到远端 L3 的 L2 可见 host buffer，并在计算完成后取回输出。这些消息
+仍作为 canonical SLR3 frame 原样转发，不在 sidecar 中实现业务语义。
 
 要求：
 
@@ -282,6 +310,7 @@ SHUTDOWN
 ```bash
 pytest -q tests/ut/py/test_mpi_sidecar_spec.py
 pytest -q tests/ut/py/test_mpi_sidecar_bootstrap.py
+pytest -q tests/ut/py/test_remote_l3_buffer_allocation.py
 ctest --test-dir tests/ut/cpp/build \
   -R '^(test_remote_wire|test_remote_endpoint|test_remote_sidecar_transport)$' \
   --output-on-failure
@@ -318,7 +347,9 @@ mpi_sidecar_sim:   L4 -> UDS/MPI remote L3 -> L2 sim -> PASS
 - 错误类型。
 - runner/L2 退出状态。
 
-#### 双机 Simpler 端到端
+这条用例是无设备快速门禁，不代替下面的真实 NPU 硬门禁。
+
+#### 双机 sim Simpler 端到端
 
 ```bash
 bash tools/mpi_l4_sidecar/run_2host_sim.sh topology.2host.json
@@ -333,30 +364,85 @@ bash tools/mpi_l4_sidecar/run_2host_sim.sh topology.2host.json
 - 正常 shutdown 后没有 sidecar、proxy、runner、UDS 或 shm 残留。
 - 同一构建中的 legacy socket 路径仍通过。
 
+#### 双机、master 位于机器 A 的真实 NPU 硬门禁
+
+拓扑与 `l4test/tools/remote_l4_npu` 的计算任务一致：
+
+```text
+机器 A / rank 0: L4 master + remote L3 worker 0 -> NPU 0 + NPU 1
+机器 B / rank 1:             remote L3 worker 1 -> NPU 0 + NPU 1
+```
+
+操作上是两台机器各开一个 daemon 终端，然后在机器 A 再开一个 master/launcher 终端。
+master 逻辑就是 `npu_e2e_case.py` 中的 `Worker(level=4)`，launcher 只负责先拉起两个
+proxy 和两个 MPI sidecar rank，再以普通 Python 子进程执行该 master。
+
+两台 NPU 主机先在已加载 CANN 环境的 checkout 中启动现有 daemon：
+
+```bash
+source .venv/bin/activate
+export ASCEND_HOME_PATH=/usr/local/Ascend/ascend-toolkit/latest
+export PATH="$ASCEND_HOME_PATH/bin:$PATH"
+python -m simpler.remote_l3_worker --host 0.0.0.0 --port 19073
+```
+
+parent 构建 sidecar、填写拓扑并运行：
+
+```bash
+source .venv/bin/activate
+export ASCEND_HOME_PATH=/usr/local/Ascend/ascend-toolkit/latest
+export PATH="$ASCEND_HOME_PATH/bin:$PATH"
+bash tools/mpi_l4_sidecar/build.sh
+cp tools/mpi_l4_sidecar/topology.2host-npu.example.json \
+  tools/mpi_l4_sidecar/topology.2host-npu.json
+bash tools/mpi_l4_sidecar/run_2host_npu.sh \
+  tools/mpi_l4_sidecar/topology.2host-npu.json
+```
+
+launcher 对同一个 vector group 用例顺序执行：
+
+```text
+legacy_socket_npu:
+  L4 -> TCP -> remote L3 A/B -> each submit_next_level_group -> 2 x L2 NPU
+
+mpi_sidecar_npu:
+  L4 master on A -> rank 0 UDS -> local rank 0 worker / MPI rank 1 worker
+     -> each submit_next_level_group -> 2 x L2 NPU
+```
+
+两条路径都必须完成动态 `ChipCallable` prepare/commit、每个 worker 六个 RemoteBuffer 的
+allocate/copy/free、两个 NPU group 执行和 golden 校验。launcher 比较两次运行的 worker
+映射、实际输出 SHA-256、expected 值和 max diff，并聚合 rank 0/1 日志校验 sidecar 两侧
+TASK/CONTROL/COMPLETION 的 sequence/hash。
+
+这一步证明的是“MPI 控制面驱动了真实跨机 NPU 计算”。输入/输出仍通过 control frame
+copy；不包含跨机 NPU buffer import/export，也不等价于第三、四阶段的 Fabric 数据面。
+
 “`mpirun` 已成功运行”的判据不是进程退出码为零，而是同时满足：
 
 ```text
 MPI world READY
 + L4 HELLO READY
-+ L4 -> remote L3 -> L2 TASK/COMPLETION PASS
++ legacy socket real-NPU golden PASS
++ MPI sidecar real-NPU golden PASS
++ legacy_vs_mpi output/hash PASS
 + 全部进程和资源正常回收
 ```
 
 ## 5. 第二阶段：完整控制语义和故障边界
 
-第一阶段通过后，补齐当前 socket remote endpoint 已支持的全部控制能力：
+第一阶段通过后，补齐当前 socket remote endpoint 的 Fabric-sim 资源语义、压力和故障边界：
 
 ```text
-ALLOC_REMOTE_BUFFER
-FREE_REMOTE_BUFFER
-COPY_TO_REMOTE
-COPY_FROM_REMOTE
 EXPORT_BUFFER（sim）
 IMPORT_BUFFER（sim）
 RELEASE_IMPORT
-动态 callable 注册事务
 并发 session/backpressure
+大 payload/总在途字节限制
 ```
+
+基本 ALLOC/FREE/COPY 和动态 callable 注册事务已被真实 NPU 第一阶段用例覆盖；第二阶段
+继续做其重复/乱序/超时/回滚故障注入，但不再把“首次可用”推迟到第二阶段。
 
 重点修改和验证：
 
@@ -481,8 +567,8 @@ PYTHONDONTWRITEBYTECODE=1 pytest -p no:cacheprovider -q \
 
 | 阶段 | 新路径硬结果 | 旧路径硬结果 | 默认行为 |
 | --- | --- | --- | --- |
-| 一 | L4 -> MPI -> L3 -> L2 sim PASS | socket L4 -> L3 -> L2 PASS | socket/sim |
-| 二 | MPI 全控制面和故障注入 PASS | socket RemoteBuffer PASS | socket/sim |
+| 一 | MPI 控制面驱动两台 remote L3 的真实双 NPU group PASS | 同一真实 NPU 用例 socket PASS | socket/sim |
+| 二 | MPI Fabric-sim 资源语义、压力和故障注入 PASS | socket RemoteBuffer PASS | socket/sim |
 | 三 | A3 handle export/import/release PASS | socket/sim buffer PASS | socket/sim |
 | 四 | L4 发起 Fabric TLOAD/TSTORE PASS | socket/sim task PASS | socket/sim |
 

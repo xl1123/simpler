@@ -110,6 +110,7 @@ class _RemoteBufferEntry:
     nbytes: int
     generation: int
     address_space: RemoteAddressSpace
+    owner: Worker | None = None
     offset: int = 0
     released: bool = False
 
@@ -119,6 +120,8 @@ class _RemoteBufferEntry:
             buf = self.data.buf
             assert buf is not None
             return ctypes.addressof(ctypes.c_char.from_buffer(buf))
+        if hasattr(self.data, "data_ptr"):
+            return int(self.data.data_ptr)
         return ctypes.addressof(self.data)
 
     @property
@@ -129,6 +132,11 @@ class _RemoteBufferEntry:
 
     def close(self, *, unlink: bool = False) -> None:
         if not isinstance(self.data, shared_memory.SharedMemory):
+            if self.owner is not None:
+                buffer = getattr(self.data, "buffer", None)
+                if isinstance(buffer, memoryview):
+                    buffer.release()
+                self.owner.free_host_buffer(self.data)
             return
         self.data.close()
         if unlink:
@@ -136,6 +144,30 @@ class _RemoteBufferEntry:
                 self.data.unlink()
             except FileNotFoundError:
                 pass
+
+
+def _allocate_remote_buffer(inner_worker: Worker, nbytes: int, platform: str) -> _RemoteBufferEntry:
+    if platform.endswith("sim"):
+        buf = shared_memory.SharedMemory(create=True, size=nbytes)
+        return _RemoteBufferEntry(buf, nbytes, 1, RemoteAddressSpace.REMOTE_DEVICE)
+    try:
+        buf = inner_worker.create_host_buffer(nbytes)
+        return _RemoteBufferEntry(
+            buf,
+            nbytes,
+            1,
+            RemoteAddressSpace.REMOTE_DEVICE,
+            owner=inner_worker,
+        )
+    except RuntimeError as exc:
+        childless_errors = (
+            "requires at least one forked chip or sub child",
+            "requires forked chip children",
+        )
+        if not any(text in str(exc) for text in childless_errors):
+            raise
+        buf = shared_memory.SharedMemory(create=True, size=nbytes)
+        return _RemoteBufferEntry(buf, nbytes, 1, RemoteAddressSpace.REMOTE_DEVICE)
 
 
 def _load_import_target(target: str) -> Callable[..., Any]:
@@ -655,9 +687,8 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                         buffer_id = next_buffer_id
                         next_buffer_id += 1
                         generation = 1
-                        buf = shared_memory.SharedMemory(create=True, size=int(nbytes))
                         key = _buffer_key(buffer_id, generation)
-                        entry = _RemoteBufferEntry(buf, int(nbytes), generation, RemoteAddressSpace.REMOTE_DEVICE)
+                        entry = _allocate_remote_buffer(inner_worker, int(nbytes), str(manifest["platform"]))
                         buffers[key] = entry
                         remote_addr = entry.addr
                         result = struct.pack(

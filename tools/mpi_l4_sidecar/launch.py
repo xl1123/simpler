@@ -80,6 +80,17 @@ def _wait_tcp(host: str, port: int, process: subprocess.Popen[Any], timeout_s: f
     raise TimeoutError(f"{label} did not listen on {host}:{port}")
 
 
+def _wait_tcp_endpoint(host: str, port: int, timeout_s: float, label: str) -> None:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=min(0.5, timeout_s)):
+                return
+        except OSError:
+            time.sleep(0.1)
+    raise TimeoutError(f"{label} did not listen on {host}:{port}")
+
+
 def _terminate(process: subprocess.Popen[Any], timeout_s: float = 5.0) -> None:
     if process.poll() is not None:
         return
@@ -129,8 +140,59 @@ def _run_case(
     return json.loads(lines[-1])
 
 
+def _run_npu_case(
+    *,
+    python: str,
+    env: dict[str, str],
+    transport: str,
+    remotes: list[dict[str, Any]],
+    bootstrap_path: Path,
+    platform: str,
+    runtime: str,
+    timeout_s: float,
+) -> dict[str, Any]:
+    command = [
+        python,
+        str(REPO_ROOT / "tools/mpi_l4_sidecar/npu_e2e_case.py"),
+        "--control-transport",
+        transport,
+        "--machine-a",
+        str(remotes[0]["daemon_endpoint"]),
+        "--machine-b",
+        str(remotes[1]["daemon_endpoint"]),
+        "--machine-a-devices",
+        ",".join(str(item) for item in remotes[0]["device_ids"]),
+        "--machine-b-devices",
+        ",".join(str(item) for item in remotes[1]["device_ids"]),
+        "--machine-a-mpi-rank",
+        str(remotes[0]["rank"]),
+        "--machine-b-mpi-rank",
+        str(remotes[1]["rank"]),
+        "--platform",
+        platform,
+        "--runtime",
+        runtime,
+        "--timeout",
+        str(timeout_s),
+    ]
+    if transport == "mpi_sidecar":
+        command += ["--sidecar-endpoint", str(bootstrap_path)]
+    result = subprocess.run(command, env=env, text=True, capture_output=True, timeout=timeout_s + 180.0)
+    if result.stdout:
+        print(result.stdout, end="")
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"{transport} NPU validation failed with {result.returncode}:\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+    lines = [line for line in result.stdout.splitlines() if line.startswith("{")]
+    if not lines:
+        raise RuntimeError(f"{transport} NPU validation emitted no JSON result")
+    return json.loads(lines[-1])
+
+
 def _compare(legacy: dict[str, Any], mpi: dict[str, Any]) -> None:
-    fields = ("status", "worker_id", "remote_l3", "inner_l2", "golden")
+    fields = tuple(sorted((set(legacy) | set(mpi)) - {"control_transport"}))
     differences = {
         field: (legacy.get(field), mpi.get(field))
         for field in fields
@@ -163,10 +225,13 @@ def _frame_records(path: Path, event: str) -> Counter[tuple[Any, ...]]:
     return records
 
 
-def _verify_frame_logs(rank0_log: Path, rank1_log: Path) -> None:
+def _verify_frame_logs(rank0_log: Path, target_logs: list[Path]) -> None:
     l4_sent = _frame_records(rank0_log, "L4_TO_MPI")
-    l3_received = _frame_records(rank1_log, "MPI_TO_L3")
-    l3_sent = _frame_records(rank1_log, "L3_TO_MPI")
+    l3_received: Counter[tuple[Any, ...]] = Counter()
+    l3_sent: Counter[tuple[Any, ...]] = Counter()
+    for path in target_logs:
+        l3_received.update(_frame_records(path, "MPI_TO_L3"))
+        l3_sent.update(_frame_records(path, "L3_TO_MPI"))
     l4_received = _frame_records(rank0_log, "MPI_TO_L4")
     if l4_sent != l3_received:
         raise RuntimeError("L4->L3 MPI command frame sequence/hash comparison failed")
@@ -306,7 +371,7 @@ def run_one_host(config: dict[str, Any]) -> int:
             timeout_s=timeout_s,
         )
         _compare(legacy, mpi)
-        _verify_frame_logs(job_dir / "proxy.0.log", job_dir / "proxy.1.log")
+        _verify_frame_logs(job_dir / "proxy.0.log", [job_dir / "proxy.1.log"])
         _stop_world(python, env, bootstrap_path, timeout_s)
         sidecar.wait(timeout=timeout_s)
         if sidecar.returncode != 0:
@@ -438,7 +503,7 @@ def run_two_host(config: dict[str, Any]) -> int:
             timeout_s=timeout_s,
         )
         _compare(legacy, mpi)
-        _verify_frame_logs(job_dir / "proxy.0.log", remote_proxy_log)
+        _verify_frame_logs(job_dir / "proxy.0.log", [remote_proxy_log])
         _stop_world(python, env, bootstrap_path, timeout_s)
         sidecar.wait(timeout=timeout_s)
         if sidecar.returncode != 0:
@@ -471,15 +536,168 @@ def run_two_host(config: dict[str, Any]) -> int:
             _terminate(process)
 
 
+def run_npu(config: dict[str, Any]) -> int:
+    python, mpi_command, sidecar_binary, timeout_s = _validate_common(config)
+    hosts = config.get("hosts")
+    if not isinstance(hosts, list) or len(hosts) != 2:
+        raise ValueError("NPU config requires exactly two machine/rank entries")
+    by_rank = {int(host["rank"]): host for host in hosts}
+    if set(by_rank) != {0, 1} or not bool(by_rank[0].get("local", False)):
+        raise ValueError("NPU phase-1 requires local/master rank 0 and remote rank 1")
+    remotes = [by_rank[0], by_rank[1]]
+    for remote in remotes:
+        device_ids = remote.get("device_ids")
+        if not isinstance(device_ids, list) or len(device_ids) != 2:
+            raise ValueError(f"rank {remote['rank']} requires exactly two device_ids")
+        endpoint = str(remote.get("daemon_endpoint", ""))
+        daemon_host, separator, daemon_port = endpoint.rpartition(":")
+        if not separator or not daemon_host:
+            raise ValueError(f"rank {remote['rank']} daemon_endpoint must be host:port")
+        _wait_tcp_endpoint(
+            daemon_host,
+            int(daemon_port),
+            timeout_s,
+            f"rank {remote['rank']} pre-started remote L3 daemon",
+        )
+
+    work_dir = str(config.get("work_dir", "/tmp"))
+    job_dir = Path(work_dir) / f"simpler-mpi-l4-npu-{uuid.uuid4().hex[:12]}"
+    job_dir.mkdir(mode=0o700, parents=True)
+    bootstrap_path = job_dir / "l4-bootstrap.sock"
+    proxy_template = str(job_dir / "proxy.%r.sock")
+    platform = str(config.get("platform", "a2a3"))
+    runtime = str(config.get("runtime", "tensormap_and_ringbuffer"))
+    env = _python_env(str(REPO_ROOT))
+    processes: list[subprocess.Popen[Any]] = []
+    remote_proxy_logs: list[Path] = []
+    remote_proxies: list[subprocess.Popen[Any]] = []
+    try:
+        rank0_proxy = _start_local(
+            _local_proxy_command(
+                python,
+                0,
+                Path(proxy_template.replace("%r", "0")),
+                job_dir / "sessions.0",
+                [0],
+                bootstrap_path,
+            ),
+            env=env,
+            log_path=job_dir / "proxy.0.log",
+            processes=processes,
+        )
+        _wait_path(Path(proxy_template.replace("%r", "0")), [rank0_proxy], timeout_s, "rank 0 proxy")
+
+        for remote in remotes[1:]:
+            rank = int(remote["rank"])
+            remote_host = str(remote["ssh"])
+            remote_python = str(remote.get("python", python))
+            remote_repo = str(remote["repo_root"])
+            remote_env = _python_env(remote_repo)
+            proxy_log = job_dir / f"proxy.{rank}.ssh.log"
+            proxy_command = _local_proxy_command(
+                remote_python,
+                rank,
+                Path(proxy_template.replace("%r", str(rank))),
+                job_dir / f"sessions.{rank}",
+                [1],
+                bootstrap_path,
+            )
+            proxy = _start_local(
+                _remote_command(remote_host, proxy_command, {"PYTHONPATH": remote_env["PYTHONPATH"]}),
+                env=env,
+                log_path=proxy_log,
+                processes=processes,
+            )
+            remote_proxies.append(proxy)
+            remote_proxy_logs.append(proxy_log)
+            _wait_log(proxy_log, "LISTENING", proxy, timeout_s, f"rank {rank} proxy")
+
+        worker_map = "0:0;1:1"
+        sidecar = _start_local(
+            mpi_command
+            + [
+                sidecar_binary,
+                "--proxy-socket-template",
+                proxy_template,
+                "--topology-id",
+                str(config.get("topology_id", "two-machine-master-real-npu-phase1")),
+                "--worker-map",
+                worker_map,
+            ],
+            env=env,
+            log_path=job_dir / "sidecar.log",
+            processes=processes,
+        )
+        _wait_path(bootstrap_path, [sidecar], timeout_s, "MPI world/L4 bootstrap")
+
+        legacy = _run_npu_case(
+            python=python,
+            env=env,
+            transport="socket",
+            remotes=remotes,
+            bootstrap_path=bootstrap_path,
+            platform=platform,
+            runtime=runtime,
+            timeout_s=timeout_s,
+        )
+        mpi = _run_npu_case(
+            python=python,
+            env=env,
+            transport="mpi_sidecar",
+            remotes=remotes,
+            bootstrap_path=bootstrap_path,
+            platform=platform,
+            runtime=runtime,
+            timeout_s=timeout_s,
+        )
+        _compare(legacy, mpi)
+        _verify_frame_logs(job_dir / "proxy.0.log", [job_dir / "proxy.0.log", *remote_proxy_logs])
+        _stop_world(python, env, bootstrap_path, timeout_s)
+        sidecar.wait(timeout=timeout_s)
+        rank0_proxy.wait(timeout=timeout_s)
+        for proxy in remote_proxies:
+            proxy.wait(timeout=timeout_s)
+        if sidecar.returncode != 0 or rank0_proxy.returncode != 0 or any(
+            proxy.returncode != 0 for proxy in remote_proxies
+        ):
+            raise RuntimeError(f"NPU MPI sidecar shutdown failed; see {job_dir}")
+        residue = list(job_dir.rglob("*.sock"))
+        if residue:
+            raise RuntimeError(f"Unix socket residue remains: {residue}")
+        for remote in remotes[1:]:
+            residue_check = subprocess.run(
+                [
+                    "ssh",
+                    str(remote["ssh"]),
+                    shlex.join(["find", str(job_dir), "-type", "s", "-print", "-quit"]),
+                ],
+                text=True,
+                capture_output=True,
+                timeout=timeout_s,
+            )
+            if residue_check.returncode != 0 or residue_check.stdout.strip():
+                raise RuntimeError(
+                    f"rank {remote['rank']} residue verification failed: "
+                    f"{residue_check.stdout}{residue_check.stderr}"
+                )
+        print(f"two-machine master real-NPU MPI sidecar phase-1 validation PASS; logs: {job_dir}")
+        return 0
+    finally:
+        for process in reversed(processes):
+            _terminate(process)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=("one-host", "two-host"), required=True)
+    parser.add_argument("--mode", choices=("one-host", "two-host", "npu"), required=True)
     parser.add_argument("--config", required=True)
     ns = parser.parse_args(argv)
     config = _load_config(ns.config)
     if ns.mode == "one-host":
         return run_one_host(config)
-    return run_two_host(config)
+    if ns.mode == "two-host":
+        return run_two_host(config)
+    return run_npu(config)
 
 
 if __name__ == "__main__":

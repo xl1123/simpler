@@ -30,10 +30,13 @@ The envelope is little-endian and has a fixed 44-byte header:
 magic/version/type/source_rank/target_rank/session_id/lane/payload_bytes/sequence
 ```
 
-Payloads are bounded at 16 MiB. `FRAME` payloads are canonical SLR3 bytes and
-must match the envelope's session and sequence. Command and health are separate
-logical lanes.
+Protocol v2 distinguishes `FRAME_L4_TO_L3` from `FRAME_L3_TO_L4`. This is
+required when rank 0 owns both the L4 bootstrap/source and a local remote L3
+target. Legacy `FRAME` remains decodable when source and target ranks differ.
+Payloads are bounded at 16 MiB and remain canonical SLR3 bytes. Command and
+health are separate logical lanes.
 
-This first-stage implementation covers bootstrap, HELLO, callable control,
-TASK, COMPLETION, HEALTH, SHUTDOWN, and cleanup for the sim L4 -> L3 -> L2
-path. Fabric handle exchange and Fabric data access remain later stages.
+This first-stage implementation covers bootstrap, HELLO, callable and remote
+buffer control, TASK, COMPLETION, HEALTH, SHUTDOWN, and cleanup. It can drive
+both the fast L2 sim regression and the real L3 -> L2 NPU group validation;
+Fabric handle exchange and Fabric data access remain later stages.

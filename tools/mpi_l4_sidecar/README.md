@@ -4,9 +4,14 @@ These files only build, launch, and validate the MPI transport implemented in
 `src/common/hierarchical/mpi_sidecar/`. The TASK and control semantics remain
 in Simpler's production `RemoteL3Endpoint` and remote L3 session.
 
+The no-device sim runs are fast regression gates. The phase-1 hardware gate is
+the two-machine/two-rank case below: it reuses the real vector L3-group workload from
+`l4test/tools/remote_l4_npu` and compares the existing TCP path with the MPI
+sidecar path.
+
 ## Build
 
-Both hosts need the same MPI implementation/ABI and an MPI C++ compiler:
+All participating hosts need the same MPI implementation/ABI and an MPI C++ compiler:
 
 ```bash
 bash tools/mpi_l4_sidecar/build.sh
@@ -78,3 +83,58 @@ no Unix socket residue
 
 The launcher only terminates processes it started for its unique job directory;
 it does not use global process names or `killall`.
+
+## Two Hosts With The Master On Machine A
+
+This mode matches `l4test/tools/remote_l4_npu`: there are exactly two machines.
+Each machine runs one remote L3 daemon and one MPI sidecar rank. Machine A also
+runs the existing L4 master process; the master is not started by `mpirun` and
+does not consume an MPI rank:
+
+```text
+machine A / rank 0: L4 master + bootstrap/source + worker 0 -> NPU 0,1
+machine B / rank 1:                         worker 1 -> NPU 0,1
+worker_map: 0:0;1:1
+```
+
+Protocol v2 carries an explicit frame direction so the rank 0 proxy can route
+both master-to-local-L3 and local-L3-to-master frames without inferring the
+direction from equal source/target ranks.
+
+Start the normal remote daemon on both NPU hosts from a checkout containing the
+same code. Source the local CANN environment first; the exact setup remains an
+installation concern rather than launcher configuration:
+
+```bash
+source .venv/bin/activate
+export ASCEND_HOME_PATH=/usr/local/Ascend/ascend-toolkit/latest
+export PATH="$ASCEND_HOME_PATH/bin:$PATH"
+python -m simpler.remote_l3_worker --host 0.0.0.0 --port 19073
+```
+
+On the parent, build the sidecar and fill in the host names, daemon IPs, Python,
+repository, MPI, and sidecar paths:
+
+```bash
+source .venv/bin/activate
+export ASCEND_HOME_PATH=/usr/local/Ascend/ascend-toolkit/latest
+export PATH="$ASCEND_HOME_PATH/bin:$PATH"
+bash tools/mpi_l4_sidecar/build.sh
+cp tools/mpi_l4_sidecar/topology.2host-npu.example.json \
+  tools/mpi_l4_sidecar/topology.2host-npu.json
+bash tools/mpi_l4_sidecar/run_2host_npu.sh \
+  tools/mpi_l4_sidecar/topology.2host-npu.json
+```
+
+The launcher leaves the two pre-existing daemons running. It first executes the
+real NPU task through the default TCP control path, then executes the same task
+through UDS/MPI P2P. Both runs dynamically install the same `ChipCallable`,
+allocate/copy/free the same remote buffers, submit the same two-device L3 group,
+and validate the same golden values. It also compares output SHA-256 records and
+aggregates frame sequence/hash records from the rank 0 local target and rank 1.
+
+`transport="sim"` in the NPU case remains the remote-buffer transport profile;
+it does not select an L2 simulator. `platform="a2a3"` plus the two `device_ids`
+causes the inner L3 worker to fork and dispatch to real L2 NPU children. This
+phase copies input/output through remote control messages and does not claim
+cross-machine NPU Fabric import/export.

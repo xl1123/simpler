@@ -18,7 +18,7 @@
 
 namespace simpler::mpi_sidecar {
 
-constexpr uint32_t PROTOCOL_VERSION = 1;
+constexpr uint32_t PROTOCOL_VERSION = 2;
 constexpr size_t HEADER_BYTES = 44;
 constexpr uint32_t MAX_PAYLOAD_BYTES = 16U * 1024U * 1024U;
 
@@ -30,6 +30,8 @@ enum class MessageType : uint32_t {
     CLOSE_SESSION = 5,
     ERROR = 6,
     SHUTDOWN = 7,
+    FRAME_L4_TO_L3 = 8,
+    FRAME_L3_TO_L4 = 9,
 };
 
 enum class Lane : uint32_t { BOOTSTRAP = 0, COMMAND = 1, HEALTH = 2 };

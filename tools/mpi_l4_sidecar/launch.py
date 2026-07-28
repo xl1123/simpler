@@ -18,6 +18,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from collections import Counter
@@ -25,6 +26,39 @@ from pathlib import Path
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _status(message: str) -> None:
+    print(f"[mpi-l4] {message}", flush=True)
+
+
+def _follow_log(path: Path, process: subprocess.Popen[Any]) -> threading.Thread:
+    """Mirror a redirected child log so MPI bootstrap prompts stay visible."""
+
+    def follow() -> None:
+        position = 0
+        while True:
+            if path.exists():
+                with path.open(encoding="utf-8", errors="replace") as stream:
+                    stream.seek(position)
+                    chunk = stream.read()
+                    position = stream.tell()
+                if chunk:
+                    print(chunk, end="", flush=True)
+            if process.poll() is not None:
+                return
+            time.sleep(0.05)
+
+    thread = threading.Thread(target=follow, name="mpi-l4-log-follower", daemon=True)
+    thread.start()
+    return thread
+
+
+def _log_tail(path: Path, limit: int = 4096) -> str:
+    if not path.exists():
+        return "<log file was not created>"
+    text = path.read_text(encoding="utf-8", errors="replace")
+    return text[-limit:] or "<log file is empty>"
 
 
 def _load_config(path: str) -> dict[str, Any]:
@@ -44,16 +78,26 @@ def _python_env(repo_root: str) -> dict[str, str]:
     return env
 
 
-def _wait_path(path: Path, processes: list[subprocess.Popen[Any]], timeout_s: float, label: str) -> None:
+def _wait_path(
+    path: Path,
+    processes: list[subprocess.Popen[Any]],
+    timeout_s: float,
+    label: str,
+    diagnostic_log: Path | None = None,
+) -> None:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         if path.exists():
             return
         for process in processes:
             if process.poll() is not None:
-                raise RuntimeError(f"{label}: process {process.args!r} exited with {process.returncode}")
+                detail = f"\nlog tail:\n{_log_tail(diagnostic_log)}" if diagnostic_log else ""
+                raise RuntimeError(
+                    f"{label}: process {process.args!r} exited with {process.returncode}{detail}"
+                )
         time.sleep(0.05)
-    raise TimeoutError(f"{label}: {path} was not created")
+    detail = f"\nlog tail:\n{_log_tail(diagnostic_log)}" if diagnostic_log else ""
+    raise TimeoutError(f"{label}: {path} was not created within {timeout_s:g}s{detail}")
 
 
 def _wait_log(path: Path, text: str, process: subprocess.Popen[Any], timeout_s: float, label: str) -> None:
@@ -82,13 +126,19 @@ def _wait_tcp(host: str, port: int, process: subprocess.Popen[Any], timeout_s: f
 
 def _wait_tcp_endpoint(host: str, port: int, timeout_s: float, label: str) -> None:
     deadline = time.monotonic() + timeout_s
+    next_report = time.monotonic() + 5.0
+    last_error = "connection was not attempted"
     while time.monotonic() < deadline:
         try:
             with socket.create_connection((host, port), timeout=min(0.5, timeout_s)):
                 return
-        except OSError:
+        except OSError as error:
+            last_error = str(error)
+            if time.monotonic() >= next_report:
+                _status(f"still waiting for {label}: {last_error}")
+                next_report = time.monotonic() + 5.0
             time.sleep(0.1)
-    raise TimeoutError(f"{label} did not listen on {host}:{port}")
+    raise TimeoutError(f"{label} did not listen on {host}:{port}: {last_error}")
 
 
 def _terminate(process: subprocess.Popen[Any], timeout_s: float = 5.0) -> None:
@@ -100,6 +150,36 @@ def _terminate(process: subprocess.Popen[Any], timeout_s: float = 5.0) -> None:
     except subprocess.TimeoutExpired:
         process.kill()
         process.wait(timeout=timeout_s)
+
+
+def _run_logged(
+    command: list[str],
+    *,
+    env: dict[str, str],
+    log_path: Path,
+    timeout_s: float,
+    label: str,
+) -> subprocess.CompletedProcess[Any]:
+    with log_path.open("w", encoding="utf-8") as log:
+        process = subprocess.Popen(
+            command,
+            env=env,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    follower = _follow_log(log_path, process)
+    try:
+        process.wait(timeout=timeout_s)
+    except subprocess.TimeoutExpired as exc:
+        _terminate(process)
+        follower.join(timeout=1.0)
+        raise TimeoutError(
+            f"{label} exceeded {timeout_s:g}s; log: {log_path}\nlog tail:\n{_log_tail(log_path)}"
+        ) from exc
+    follower.join(timeout=1.0)
+    output = log_path.read_text(encoding="utf-8", errors="replace")
+    return subprocess.CompletedProcess(command, process.returncode, output, "")
 
 
 def _run_case(
@@ -150,6 +230,7 @@ def _run_npu_case(
     platform: str,
     runtime: str,
     timeout_s: float,
+    log_path: Path,
 ) -> dict[str, Any]:
     command = [
         python,
@@ -177,9 +258,13 @@ def _run_npu_case(
     ]
     if transport == "mpi_sidecar":
         command += ["--sidecar-endpoint", str(bootstrap_path)]
-    result = subprocess.run(command, env=env, text=True, capture_output=True, timeout=timeout_s + 180.0)
-    if result.stdout:
-        print(result.stdout, end="")
+    result = _run_logged(
+        command,
+        env=env,
+        log_path=log_path,
+        timeout_s=timeout_s + 180.0,
+        label=f"{transport} NPU validation",
+    )
     if result.returncode != 0:
         raise RuntimeError(
             f"{transport} NPU validation failed with {result.returncode}:\n"
@@ -263,12 +348,19 @@ def _stop_world(python: str, env: dict[str, str], bootstrap_path: Path, timeout_
 
 
 def _start_local(
-    command: list[str], *, env: dict[str, str], log_path: Path, processes: list[subprocess.Popen[Any]]
+    command: list[str],
+    *,
+    env: dict[str, str],
+    log_path: Path,
+    processes: list[subprocess.Popen[Any]],
+    echo_log: bool = False,
 ) -> subprocess.Popen[Any]:
     log = open(log_path, "w", encoding="utf-8")
     process = subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
     log.close()
     processes.append(process)
+    if echo_log:
+        _follow_log(log_path, process)
     return process
 
 
@@ -618,18 +710,24 @@ def run_npu(config: dict[str, Any]) -> int:
         daemon_host, separator, daemon_port = endpoint.rpartition(":")
         if not separator or not daemon_host:
             raise ValueError(f"rank {remote['rank']} daemon_endpoint must be host:port")
+        _status(
+            f"checking rank {remote['rank']} remote L3 daemon at {daemon_host}:{daemon_port}"
+        )
         _wait_tcp_endpoint(
             daemon_host,
             int(daemon_port),
             timeout_s,
             f"rank {remote['rank']} pre-started remote L3 daemon",
         )
+        _status(f"rank {remote['rank']} remote L3 daemon READY")
 
     work_dir = str(config.get("work_dir", "/tmp"))
     job_dir = Path(work_dir) / f"simpler-mpi-l4-npu-{uuid.uuid4().hex[:12]}"
     job_dir.mkdir(mode=0o700, parents=True)
+    _status(f"job directory: {job_dir}")
     if not mpi_command:
         mpi_command = _derived_npu_mpi_command(config, remotes, job_dir)
+    _status(f"MPI command: {shlex.join(mpi_command)}")
     bootstrap_path = job_dir / "l4-bootstrap.sock"
     proxy_template = str(job_dir / "proxy.%r.sock")
     session_dir_template = str(job_dir / "sessions.%r")
@@ -640,6 +738,7 @@ def run_npu(config: dict[str, Any]) -> int:
     try:
         worker_map = "0:0;1:1"
         sidecar_log = job_dir / "sidecar.log"
+        _status(f"starting MPI sidecars; live output is also saved to {sidecar_log}")
         sidecar = _start_local(
             _managed_sidecar_command(
                 mpi_command=mpi_command,
@@ -655,9 +754,19 @@ def run_npu(config: dict[str, Any]) -> int:
             env=env,
             log_path=sidecar_log,
             processes=processes,
+            echo_log=True,
         )
-        _wait_path(bootstrap_path, [sidecar], timeout_s, "MPI world/L4 bootstrap")
+        _status(f"waiting up to {timeout_s:g}s for MPI world/L4 bootstrap")
+        _wait_path(
+            bootstrap_path,
+            [sidecar],
+            timeout_s,
+            "MPI world/L4 bootstrap",
+            diagnostic_log=sidecar_log,
+        )
+        _status("MPI world/L4 bootstrap READY")
 
+        _status("starting baseline socket control-path NPU case")
         legacy = _run_npu_case(
             python=python,
             env=env,
@@ -667,7 +776,10 @@ def run_npu(config: dict[str, Any]) -> int:
             platform=platform,
             runtime=runtime,
             timeout_s=timeout_s,
+            log_path=job_dir / "socket-npu-case.log",
         )
+        _status("baseline socket control-path NPU case PASS")
+        _status("starting MPI-sidecar control-path NPU case")
         mpi = _run_npu_case(
             python=python,
             env=env,
@@ -677,9 +789,12 @@ def run_npu(config: dict[str, Any]) -> int:
             platform=platform,
             runtime=runtime,
             timeout_s=timeout_s,
+            log_path=job_dir / "mpi-sidecar-npu-case.log",
         )
+        _status("MPI-sidecar control-path NPU case PASS")
         _compare(legacy, mpi)
         _verify_frame_logs(sidecar_log, [sidecar_log])
+        _status("stopping MPI world")
         _stop_world(python, env, bootstrap_path, timeout_s)
         sidecar.wait(timeout=timeout_s)
         if sidecar.returncode != 0:

@@ -24,6 +24,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections import deque
 from typing import Any
 
 
@@ -140,6 +141,28 @@ def _reap_session_runner(proc: subprocess.Popen[Any]) -> None:
         pass
 
 
+def _relay_runner_stderr(
+    proc: subprocess.Popen[Any],
+) -> tuple[threading.Thread | None, deque[str]]:
+    stream = getattr(proc, "stderr", None)
+    tail: deque[str] = deque(maxlen=64)
+    if stream is None:
+        return None, tail
+
+    def relay() -> None:
+        for line in stream:
+            tail.append(line)
+            print(f"[remote-l3 runner pid={proc.pid}] {line}", end="", file=sys.stderr, flush=True)
+
+    thread = threading.Thread(target=relay, args=(), daemon=True)
+    thread.start()
+    return thread, tail
+
+
+def _runner_stderr_tail(chunks: deque[str], limit: int = 4096) -> str:
+    return "".join(chunks)[-limit:].strip()
+
+
 def _start_session(manifest: dict[str, Any]) -> tuple[dict[str, Any], subprocess.Popen[Any] | None]:
     # Returns (reply, proc). proc is the live, ready runner handle when the reply
     # is ok — the caller owns it: hand it to a background reaper once the reply
@@ -160,6 +183,8 @@ def _start_session(manifest: dict[str, Any]) -> tuple[dict[str, Any], subprocess
     ready_r, ready_w = os.pipe()
     manifest_path = ""
     proc: subprocess.Popen[Any] | None = None
+    stderr_thread: threading.Thread | None = None
+    stderr_tail: deque[str] = deque()
     try:
         runner_remaining = deadline - time.monotonic()
         if runner_remaining <= 0:
@@ -189,16 +214,25 @@ def _start_session(manifest: dict[str, Any]) -> tuple[dict[str, Any], subprocess
             ],
             pass_fds=(ready_w,),
             close_fds=True,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
             # Own session/group so the daemon can killpg the whole runner
             # subtree (runner + eagerly-forked inner L3->L2 children).
             start_new_session=True,
         )
+        stderr_thread, stderr_tail = _relay_runner_stderr(proc)
         os.close(ready_w)
         ready_w = -1
         try:
             ready = _read_runner_ready(ready_r, deadline)
-        except BaseException:
+        except BaseException as exc:
             _wait_or_kill_runner(proc)
+            if stderr_thread is not None:
+                stderr_thread.join(timeout=1.0)
+            detail = _runner_stderr_tail(stderr_tail)
+            if detail and isinstance(exc, Exception):
+                raise RuntimeError(f"{exc}\nsession runner stderr:\n{detail}") from exc
             raise
         ready["pid"] = int(proc.pid)
         if not ready.get("ok", False):
@@ -274,6 +308,7 @@ def serve(host: str, port: int) -> int:
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind((host, port))
     server.listen()
+    print(f"Remote L3 daemon LISTENING {host}:{port}", flush=True)
     try:
         _serve_loop(server)
     finally:

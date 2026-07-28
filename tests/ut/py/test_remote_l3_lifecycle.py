@@ -8,6 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 
 import contextlib
+import io
 import json
 import os
 import socket
@@ -169,6 +170,29 @@ def test_start_session_kills_runner_on_ready_timeout(monkeypatch):
     assert fake_proc.terminated
     assert fake_proc.killed
     assert fake_proc.wait_calls >= 1
+
+
+def test_start_session_returns_import_stderr_when_runner_exits_before_ready(monkeypatch, capsys):
+    class FakePopen:
+        pid = 12345
+        stderr = io.StringIO("ImportError: GLIBCXX_3.4.26 not found\n")
+
+        def wait(self, timeout=None):
+            return 1
+
+    monkeypatch.setattr(remote_l3_worker.subprocess, "Popen", lambda *args, **kwargs: FakePopen())
+    monkeypatch.setattr(
+        remote_l3_worker,
+        "_read_runner_ready",
+        lambda fd, deadline: (_ for _ in ()).throw(
+            RuntimeError("session runner exited before sending ready payload")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="GLIBCXX_3.4.26"):
+        remote_l3_worker._start_session(_manifest(startup_remaining_s=30.0))
+
+    assert "[remote-l3 runner pid=12345] ImportError" in capsys.readouterr().err
 
 
 def test_start_session_returns_live_runner_without_reaping(monkeypatch):

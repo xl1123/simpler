@@ -54,7 +54,7 @@ def remote_l3_group_orch(orch, args, cfg):
         task_args.add_tensor(args.tensor(offset + 2), TensorArgType.OUTPUT_EXISTING)
         chip_args.append(task_args)
     _REMOTE_GROUP_KEEPALIVE[:] = chip_args
-    orch.submit_next_level_group(chip_handle, chip_args, cfg)
+    orch.submit_next_level_group(chip_handle, chip_args, cfg, workers=[0, 1])
 
 
 def _build_vector_chip_callable(platform: str, runtime: str) -> ChipCallable:
@@ -199,6 +199,7 @@ def _remote_spec(
 def run_case(ns: argparse.Namespace) -> dict[str, object]:
     machine_a_devices = _parse_device_ids(ns.machine_a_devices)
     machine_b_devices = _parse_device_ids(ns.machine_b_devices)
+    print(f"[npu-case:{ns.control_transport}] compiling vector kernels", flush=True)
     chip = _build_vector_chip_callable(ns.platform, ns.runtime)
     digest, payload = _remote_chip_register_payload(chip, platform=ns.platform, runtime=ns.runtime)
     worker = Worker(level=4, num_sub_workers=0, remote_session_timeout_s=ns.timeout)
@@ -212,7 +213,9 @@ def run_case(ns: argparse.Namespace) -> dict[str, object]:
             _remote_spec(ns, ns.machine_b, machine_b_devices, ns.machine_b_mpi_rank)
         )
         remote_handle = worker.register(RemoteCallable(REMOTE_ORCH_TARGET), workers=[worker_a, worker_b])
+        print(f"[npu-case:{ns.control_transport}] initializing L4 and two remote L3 workers", flush=True)
         worker.init()
+        print(f"[npu-case:{ns.control_transport}] installing L2 chip callable", flush=True)
         _install_inner_chip_callable(worker, worker_a, digest, payload)
         _install_inner_chip_callable(worker, worker_b, digest, payload)
 
@@ -252,8 +255,10 @@ def run_case(ns: argparse.Namespace) -> dict[str, object]:
         config = CallConfig()
         config.block_dim = 3
         config.aicpu_thread_num = 4
+        print(f"[npu-case:{ns.control_transport}] submitting cross-machine NPU task", flush=True)
         worker.run(parent_orch, config=config)
 
+        print(f"[npu-case:{ns.control_transport}] reading and checking NPU outputs", flush=True)
         for worker_id, handles in group_handles.items():
             worker.remote_copy_from(handles[2], output_arrays[worker_id]["group0"][0], tensor_nbytes)
             worker.remote_copy_from(handles[5], output_arrays[worker_id]["group1"][0], tensor_nbytes)

@@ -20,6 +20,7 @@ import enum
 import hashlib
 import json
 import os
+import signal
 import socket
 import struct
 import sys
@@ -790,6 +791,11 @@ def main(argv: list[str] | None = None) -> int:
         return stop_world(ns.stop_world)
     if ns.rank is None or not ns.sidecar_socket or not ns.session_dir:
         parser.error("--rank, --sidecar-socket and --session-dir are required in server mode")
+
+    def terminate(_signum, _frame):
+        raise SystemExit(128 + signal.SIGTERM)
+
+    signal.signal(signal.SIGTERM, terminate)
     worker_ids = {int(item) for item in ns.worker_ids.split(",") if item}
     proxy = SidecarProxy(
         rank=ns.rank,

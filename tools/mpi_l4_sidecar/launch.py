@@ -206,10 +206,11 @@ def _compare(legacy: dict[str, Any], mpi: dict[str, Any]) -> None:
 def _frame_records(path: Path, event: str) -> Counter[tuple[Any, ...]]:
     records: Counter[tuple[Any, ...]] = Counter()
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        if not line.startswith("{"):
+        json_start = line.find("{")
+        if json_start < 0:
             continue
         try:
-            record = json.loads(line)
+            record = json.loads(line[json_start:])
         except json.JSONDecodeError:
             continue
         if record.get("event") != event or record.get("lane") != "COMMAND":
@@ -292,16 +293,78 @@ def _local_proxy_command(
     return command
 
 
-def _validate_common(config: dict[str, Any]) -> tuple[str, list[str], str, float]:
+def _managed_sidecar_command(
+    *,
+    mpi_command: list[str],
+    sidecar_binary: str,
+    python: str,
+    proxy_template: str,
+    session_dir_template: str,
+    bootstrap_path: Path,
+    topology_id: str,
+    worker_map: str,
+    timeout_s: float,
+) -> list[str]:
+    return mpi_command + [
+        sidecar_binary,
+        "--proxy-socket-template",
+        proxy_template,
+        "--topology-id",
+        topology_id,
+        "--worker-map",
+        worker_map,
+        "--manage-proxy",
+        "--proxy-python",
+        python,
+        "--proxy-session-dir-template",
+        session_dir_template,
+        "--bootstrap-socket",
+        str(bootstrap_path),
+        "--proxy-startup-timeout-ms",
+        str(max(1, int(timeout_s * 1000))),
+    ]
+
+
+def _validate_common(
+    config: dict[str, Any], *, allow_derived_mpi_command: bool = False
+) -> tuple[str, list[str], str, float]:
     python = str(config.get("python", sys.executable))
     mpi_command = config.get("mpi_command")
-    if not isinstance(mpi_command, list) or not mpi_command:
+    if mpi_command is None and allow_derived_mpi_command:
+        parsed_mpi_command: list[str] = []
+    elif not isinstance(mpi_command, list) or not mpi_command:
         raise ValueError("config.mpi_command must be the full mpirun prefix as a JSON string array")
+    else:
+        parsed_mpi_command = [str(item) for item in mpi_command]
     sidecar_binary = str(config["sidecar_binary"])
     timeout_s = float(config.get("timeout_s", 30.0))
     if timeout_s <= 0:
         raise ValueError("timeout_s must be positive")
-    return python, [str(item) for item in mpi_command], sidecar_binary, timeout_s
+    return python, parsed_mpi_command, sidecar_binary, timeout_s
+
+
+def _derived_npu_mpi_command(
+    config: dict[str, Any], remotes: list[dict[str, Any]], job_dir: Path
+) -> list[str]:
+    mpi = config.get("mpi")
+    if not isinstance(mpi, dict):
+        raise ValueError("NPU config requires config.mpi when config.mpi_command is omitted")
+    implementation = str(mpi.get("implementation", ""))
+    if implementation not in ("openmpi", "mpich"):
+        raise ValueError("config.mpi.implementation must be 'openmpi' or 'mpich'")
+    launcher = str(mpi.get("launcher", ""))
+    if not launcher:
+        raise ValueError("config.mpi.launcher must be non-empty")
+    mpi_hosts = [str(remote.get("mpi_host", "")) for remote in remotes]
+    if any(not host for host in mpi_hosts) or len(set(mpi_hosts)) != len(mpi_hosts):
+        raise ValueError("each NPU host requires a distinct non-empty mpi_host")
+
+    hostfile = job_dir / "mpi.hostfile"
+    if implementation == "openmpi":
+        hostfile.write_text("".join(f"{host} slots=1\n" for host in mpi_hosts), encoding="utf-8")
+        return [launcher, "--hostfile", str(hostfile), "-np", "2"]
+    hostfile.write_text("".join(f"{host}\n" for host in mpi_hosts), encoding="utf-8")
+    return [launcher, "-f", str(hostfile), "-ppn", "1", "-np", "2"]
 
 
 def run_one_host(config: dict[str, Any]) -> int:
@@ -537,7 +600,9 @@ def run_two_host(config: dict[str, Any]) -> int:
 
 
 def run_npu(config: dict[str, Any]) -> int:
-    python, mpi_command, sidecar_binary, timeout_s = _validate_common(config)
+    python, mpi_command, sidecar_binary, timeout_s = _validate_common(
+        config, allow_derived_mpi_command=True
+    )
     hosts = config.get("hosts")
     if not isinstance(hosts, list) or len(hosts) != 2:
         raise ValueError("NPU config requires exactly two machine/rank entries")
@@ -563,69 +628,32 @@ def run_npu(config: dict[str, Any]) -> int:
     work_dir = str(config.get("work_dir", "/tmp"))
     job_dir = Path(work_dir) / f"simpler-mpi-l4-npu-{uuid.uuid4().hex[:12]}"
     job_dir.mkdir(mode=0o700, parents=True)
+    if not mpi_command:
+        mpi_command = _derived_npu_mpi_command(config, remotes, job_dir)
     bootstrap_path = job_dir / "l4-bootstrap.sock"
     proxy_template = str(job_dir / "proxy.%r.sock")
+    session_dir_template = str(job_dir / "sessions.%r")
     platform = str(config.get("platform", "a2a3"))
     runtime = str(config.get("runtime", "tensormap_and_ringbuffer"))
     env = _python_env(str(REPO_ROOT))
     processes: list[subprocess.Popen[Any]] = []
-    remote_proxy_logs: list[Path] = []
-    remote_proxies: list[subprocess.Popen[Any]] = []
     try:
-        rank0_proxy = _start_local(
-            _local_proxy_command(
-                python,
-                0,
-                Path(proxy_template.replace("%r", "0")),
-                job_dir / "sessions.0",
-                [0],
-                bootstrap_path,
+        worker_map = "0:0;1:1"
+        sidecar_log = job_dir / "sidecar.log"
+        sidecar = _start_local(
+            _managed_sidecar_command(
+                mpi_command=mpi_command,
+                sidecar_binary=sidecar_binary,
+                python=python,
+                proxy_template=proxy_template,
+                session_dir_template=session_dir_template,
+                bootstrap_path=bootstrap_path,
+                topology_id=str(config.get("topology_id", "two-machine-master-real-npu-phase1")),
+                worker_map=worker_map,
+                timeout_s=timeout_s,
             ),
             env=env,
-            log_path=job_dir / "proxy.0.log",
-            processes=processes,
-        )
-        _wait_path(Path(proxy_template.replace("%r", "0")), [rank0_proxy], timeout_s, "rank 0 proxy")
-
-        for remote in remotes[1:]:
-            rank = int(remote["rank"])
-            remote_host = str(remote["ssh"])
-            remote_python = str(remote.get("python", python))
-            remote_repo = str(remote["repo_root"])
-            remote_env = _python_env(remote_repo)
-            proxy_log = job_dir / f"proxy.{rank}.ssh.log"
-            proxy_command = _local_proxy_command(
-                remote_python,
-                rank,
-                Path(proxy_template.replace("%r", str(rank))),
-                job_dir / f"sessions.{rank}",
-                [1],
-                bootstrap_path,
-            )
-            proxy = _start_local(
-                _remote_command(remote_host, proxy_command, {"PYTHONPATH": remote_env["PYTHONPATH"]}),
-                env=env,
-                log_path=proxy_log,
-                processes=processes,
-            )
-            remote_proxies.append(proxy)
-            remote_proxy_logs.append(proxy_log)
-            _wait_log(proxy_log, "LISTENING", proxy, timeout_s, f"rank {rank} proxy")
-
-        worker_map = "0:0;1:1"
-        sidecar = _start_local(
-            mpi_command
-            + [
-                sidecar_binary,
-                "--proxy-socket-template",
-                proxy_template,
-                "--topology-id",
-                str(config.get("topology_id", "two-machine-master-real-npu-phase1")),
-                "--worker-map",
-                worker_map,
-            ],
-            env=env,
-            log_path=job_dir / "sidecar.log",
+            log_path=sidecar_log,
             processes=processes,
         )
         _wait_path(bootstrap_path, [sidecar], timeout_s, "MPI world/L4 bootstrap")
@@ -651,35 +679,14 @@ def run_npu(config: dict[str, Any]) -> int:
             timeout_s=timeout_s,
         )
         _compare(legacy, mpi)
-        _verify_frame_logs(job_dir / "proxy.0.log", [job_dir / "proxy.0.log", *remote_proxy_logs])
+        _verify_frame_logs(sidecar_log, [sidecar_log])
         _stop_world(python, env, bootstrap_path, timeout_s)
         sidecar.wait(timeout=timeout_s)
-        rank0_proxy.wait(timeout=timeout_s)
-        for proxy in remote_proxies:
-            proxy.wait(timeout=timeout_s)
-        if sidecar.returncode != 0 or rank0_proxy.returncode != 0 or any(
-            proxy.returncode != 0 for proxy in remote_proxies
-        ):
+        if sidecar.returncode != 0:
             raise RuntimeError(f"NPU MPI sidecar shutdown failed; see {job_dir}")
         residue = list(job_dir.rglob("*.sock"))
         if residue:
             raise RuntimeError(f"Unix socket residue remains: {residue}")
-        for remote in remotes[1:]:
-            residue_check = subprocess.run(
-                [
-                    "ssh",
-                    str(remote["ssh"]),
-                    shlex.join(["find", str(job_dir), "-type", "s", "-print", "-quit"]),
-                ],
-                text=True,
-                capture_output=True,
-                timeout=timeout_s,
-            )
-            if residue_check.returncode != 0 or residue_check.stdout.strip():
-                raise RuntimeError(
-                    f"rank {remote['rank']} residue verification failed: "
-                    f"{residue_check.stdout}{residue_check.stderr}"
-                )
         print(f"two-machine master real-NPU MPI sidecar phase-1 validation PASS; logs: {job_dir}")
         return 0
     finally:

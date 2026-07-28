@@ -1,0 +1,28 @@
+{
+  "python": "/home/x00611368/PTO/mpirun_l4/.venv/bin/python",
+  "mpi": {
+    "implementation": "mpich",
+    "launcher": "/home/x00611368/mpich-install/bin/mpirun"
+  },
+  "sidecar_binary": "/home/x00611368/PTO/mpirun_l4/build/mpi_l4_sidecar/simpler-mpi-l4-sidecar",
+  "platform": "a2a3",
+  "runtime": "tensormap_and_ringbuffer",
+  "timeout_s": 300,
+  "work_dir": "/tmp",
+  "topology_id": "120.9.10.37-120.9.10.35-real-npu-phase1",
+  "hosts": [
+    {
+      "rank": 0,
+      "local": true,
+      "mpi_host": "120.9.10.37",
+      "daemon_endpoint": "120.9.10.37:19073",
+      "device_ids": [0, 1]
+    },
+    {
+      "rank": 1,
+      "mpi_host": "120.9.10.35",
+      "daemon_endpoint": "120.9.10.35:19073",
+      "device_ids": [0, 1]
+    }
+  ]
+}

@@ -8,8 +8,10 @@ the default CMake build. Build it only on hosts with an MPI C++ toolchain:
 bash tools/mpi_l4_sidecar/build.sh
 ```
 
-The launcher starts one `simpler.remote_l3_sidecar_proxy` per MPI rank before
-starting this executable with `mpirun`. The sidecar then:
+The two-machine NPU launcher starts this executable once per rank with
+`mpirun`. In managed-proxy mode each rank first forks and execs its own local
+`simpler.remote_l3_sidecar_proxy`; modes that do not pass `--manage-proxy`
+retain the original pre-started-proxy contract. The sidecar then:
 
 1. connects the rank-local proxy before `MPI_Init_thread`;
 2. initializes MPI with `MPI_THREAD_FUNNELED`;
@@ -18,6 +20,12 @@ starting this executable with `mpirun`. The sidecar then:
 5. forwards versioned envelopes with MPI P2P while leaving SLR3 payloads
    unchanged;
 6. exits through a rank-0 bounded world shutdown.
+
+Managed-proxy ranks wait for their local proxy socket before `MPI_Init`, and
+wait for a clean proxy exit after `MPI_Finalize`. Proxy startup, UDS cleanup,
+and failures are therefore reflected in the MPI rank exit status. Simpler does
+not issue a separate SSH command for the remote proxy; on unmanaged hosts the
+MPI implementation may still use SSH as its process launcher.
 
 Only the sidecar main thread calls MPI. The proxy owns JSON parsing, Unix
 sockets, remote-daemon bootstrap, and runner command/health TCP sockets.

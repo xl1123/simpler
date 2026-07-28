@@ -196,6 +196,7 @@ tools/mpi_l4_sidecar/
   run_2host_sim.sh
   run_2host_npu.sh
   topology.example.json
+  topology.2host-npu.json
   topology.2host-npu.example.json
   verify_no_residue.sh
 ```
@@ -217,9 +218,9 @@ worker_map: 0:0;1:1
 
 启动流程：
 
-1. `mpirun` 启动 sidecar executable。
-2. launcher 先启动本机 `remote_l3_sidecar_proxy.py` 并等待 internal UDS READY；
-   sidecar 在 `MPI_Init` 前连接该 proxy，禁止在 `MPI_Init` 后 fork/exec。
+1. launcher 生成 hostfile，并且只调用一次 `mpirun` 启动两个 sidecar rank。
+2. 每个 sidecar rank 在 `MPI_Init` 前 fork/exec 本机 `remote_l3_sidecar_proxy.py`，等待
+   internal UDS READY 后连接；不由 launcher 通过额外 SSH 启动远端 proxy。
 3. sidecar 调用 `MPI_Init_thread(..., MPI_THREAD_FUNNELED, ...)`，只有主线程调用 MPI。
 4. `MPI_Allgather` 校验 rank、hostname、role、worker_id 集合和公共配置摘要。
 5. 所有 rank 拓扑一致后，rank 0 proxy 才发布 bootstrap UDS READY。
@@ -374,8 +375,10 @@ bash tools/mpi_l4_sidecar/run_2host_sim.sh topology.2host.json
 ```
 
 操作上是两台机器各开一个 daemon 终端，然后在机器 A 再开一个 master/launcher 终端。
-master 逻辑就是 `npu_e2e_case.py` 中的 `Worker(level=4)`，launcher 只负责先拉起两个
-proxy 和两个 MPI sidecar rank，再以普通 Python 子进程执行该 master。
+master 逻辑就是 `npu_e2e_case.py` 中的 `Worker(level=4)`。launcher 根据
+`mpi.implementation` 和两个 `mpi_host` 生成 hostfile，一次 `mpirun` 拉起两个 sidecar
+rank；每个 rank 在本机管理自己的 proxy，再由 launcher 以普通 Python 子进程执行 master。
+裸机上的 MPI 实现仍可能在内部使用 SSH，但 Simpler 不再保存 `hosts[].ssh` 或执行 SSH 命令。
 
 两台 NPU 主机先在已加载 CANN 环境的 checkout 中启动现有 daemon：
 
@@ -393,8 +396,6 @@ source .venv/bin/activate
 export ASCEND_HOME_PATH=/usr/local/Ascend/ascend-toolkit/latest
 export PATH="$ASCEND_HOME_PATH/bin:$PATH"
 bash tools/mpi_l4_sidecar/build.sh
-cp tools/mpi_l4_sidecar/topology.2host-npu.example.json \
-  tools/mpi_l4_sidecar/topology.2host-npu.json
 bash tools/mpi_l4_sidecar/run_2host_npu.sh \
   tools/mpi_l4_sidecar/topology.2host-npu.json
 ```
@@ -566,7 +567,7 @@ PYTHONDONTWRITEBYTECODE=1 pytest -p no:cacheprovider -q \
 合入矩阵：
 
 | 阶段 | 新路径硬结果 | 旧路径硬结果 | 默认行为 |
-| --- | --- | --- | --- |
+| ---- | ------------ | ------------ | -------- |
 | 一 | MPI 控制面驱动两台 remote L3 的真实双 NPU group PASS | 同一真实 NPU 用例 socket PASS | socket/sim |
 | 二 | MPI Fabric-sim 资源语义、压力和故障注入 PASS | socket RemoteBuffer PASS | socket/sim |
 | 三 | A3 handle export/import/release PASS | socket/sim buffer PASS | socket/sim |

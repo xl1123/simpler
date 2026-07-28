@@ -112,26 +112,39 @@ export PATH="$ASCEND_HOME_PATH/bin:$PATH"
 python -m simpler.remote_l3_worker --host 0.0.0.0 --port 19073
 ```
 
-On the parent, build the sidecar and fill in the host names, daemon IPs, Python,
-repository, MPI, and sidecar paths:
+The tracked `topology.2host-npu.json` contains the production placement for
+`120.9.10.37` and `120.9.10.35`. Use
+`topology.2host-npu.example.json` when validating another machine pair.
+
+On the production parent, build the sidecar and run the tracked topology:
 
 ```bash
 source .venv/bin/activate
 export ASCEND_HOME_PATH=/usr/local/Ascend/ascend-toolkit/latest
 export PATH="$ASCEND_HOME_PATH/bin:$PATH"
 bash tools/mpi_l4_sidecar/build.sh
-cp tools/mpi_l4_sidecar/topology.2host-npu.example.json \
-  tools/mpi_l4_sidecar/topology.2host-npu.json
 bash tools/mpi_l4_sidecar/run_2host_npu.sh \
   tools/mpi_l4_sidecar/topology.2host-npu.json
 ```
 
-The launcher leaves the two pre-existing daemons running. It first executes the
-real NPU task through the default TCP control path, then executes the same task
-through UDS/MPI P2P. Both runs dynamically install the same `ChipCallable`,
+The launcher leaves the two pre-existing daemons running. One `mpirun` starts
+both sidecar ranks; each rank starts and owns its local Python proxy. There is
+no separate Simpler SSH command or `hosts[].ssh` topology field. On bare hosts,
+OpenMPI/MPICH may still use passwordless SSH internally to launch the remote
+MPI rank, just as `mpirun-test/tools/a3_hccl_smoke` does.
+
+As in `mpirun-test`, the launcher creates a per-run hostfile. MPICH uses
+`-f <hostfile> -ppn 1 -np 2`; OpenMPI uses a two-entry, one-slot-per-host
+hostfile with `-np 2`. The legacy full `mpi_command` array remains accepted,
+but `mpi` plus `mpi_host` is the preferred NPU configuration.
+
+The launcher first executes the real NPU task through the default TCP control
+path, then executes the same task through UDS/MPI P2P. Both runs dynamically install the same `ChipCallable`,
 allocate/copy/free the same remote buffers, submit the same two-device L3 group,
 and validate the same golden values. It also compares output SHA-256 records and
-aggregates frame sequence/hash records from the rank 0 local target and rank 1.
+aggregates frame sequence/hash records from the combined MPI output. Each rank
+waits for its local proxy to exit and rejects a leftover proxy UDS before the
+MPI job can report success.
 
 `transport="sim"` in the NPU case remains the remote-buffer transport profile;
 it does not select an L2 simulator. `platform="a2a3"` plus the two `device_ids`

@@ -13,11 +13,15 @@
 
 #include <mpi.h>
 #include <poll.h>
+#include <signal.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cerrno>
 #include <cstring>
 #include <cstdlib>
@@ -27,6 +31,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace sidecar = simpler::mpi_sidecar;
@@ -39,6 +44,11 @@ struct Options {
     std::string proxy_socket_template;
     std::string topology_id;
     std::string worker_map;
+    bool manage_proxy{false};
+    std::string proxy_python;
+    std::string proxy_session_dir_template;
+    std::string bootstrap_socket;
+    int proxy_startup_timeout_ms{30000};
 };
 
 struct PendingSend {
@@ -61,9 +71,20 @@ Options parse_options(int argc, char **argv) {
             options.topology_id = require_value(argc, argv, i, "--topology-id");
         } else if (arg == "--worker-map") {
             options.worker_map = require_value(argc, argv, i, "--worker-map");
+        } else if (arg == "--manage-proxy") {
+            options.manage_proxy = true;
+        } else if (arg == "--proxy-python") {
+            options.proxy_python = require_value(argc, argv, i, "--proxy-python");
+        } else if (arg == "--proxy-session-dir-template") {
+            options.proxy_session_dir_template = require_value(argc, argv, i, "--proxy-session-dir-template");
+        } else if (arg == "--bootstrap-socket") {
+            options.bootstrap_socket = require_value(argc, argv, i, "--bootstrap-socket");
+        } else if (arg == "--proxy-startup-timeout-ms") {
+            options.proxy_startup_timeout_ms = std::stoi(require_value(argc, argv, i, "--proxy-startup-timeout-ms"));
         } else if (arg == "--help") {
             std::cout << "Usage: simpler-mpi-l4-sidecar --proxy-socket-template PATH_WITH_%r "
-                         "--topology-id ID --worker-map MAP\n";
+                         "--topology-id ID --worker-map MAP [--manage-proxy --proxy-python PYTHON "
+                         "--proxy-session-dir-template PATH_WITH_%r --bootstrap-socket PATH]\n";
             std::exit(0);
         } else {
             throw std::invalid_argument("unknown argument: " + arg);
@@ -75,6 +96,19 @@ Options parse_options(int argc, char **argv) {
     }
     if (options.topology_id.empty()) throw std::invalid_argument("--topology-id is required");
     if (options.worker_map.empty()) throw std::invalid_argument("--worker-map is required");
+    if (options.proxy_startup_timeout_ms <= 0) {
+        throw std::invalid_argument("--proxy-startup-timeout-ms must be positive");
+    }
+    if (options.manage_proxy) {
+        if (options.proxy_python.empty()) throw std::invalid_argument("--proxy-python is required with --manage-proxy");
+        if (options.proxy_session_dir_template.empty() ||
+            options.proxy_session_dir_template.find("%r") == std::string::npos) {
+            throw std::invalid_argument("--proxy-session-dir-template with %r is required with --manage-proxy");
+        }
+        if (options.bootstrap_socket.empty()) {
+            throw std::invalid_argument("--bootstrap-socket is required with --manage-proxy");
+        }
+    }
     return options;
 }
 
@@ -85,7 +119,7 @@ std::string rank_path(const std::string &path_template, int rank) {
     return result;
 }
 
-int connect_proxy(const std::string &path) {
+int try_connect_proxy(const std::string &path, int *error) {
     sockaddr_un address{};
     if (path.size() >= sizeof(address.sun_path)) throw std::invalid_argument("proxy socket path is too long");
     address.sun_family = AF_UNIX;
@@ -93,10 +127,17 @@ int connect_proxy(const std::string &path) {
     int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) throw std::runtime_error(std::string("proxy socket failed: ") + std::strerror(errno));
     if (::connect(fd, reinterpret_cast<sockaddr *>(&address), sizeof(address)) != 0) {
-        int error = errno;
+        *error = errno;
         ::close(fd);
-        throw std::runtime_error("proxy connect failed for " + path + ": " + std::strerror(error));
+        return -1;
     }
+    return fd;
+}
+
+int connect_proxy(const std::string &path) {
+    int error = 0;
+    int fd = try_connect_proxy(path, &error);
+    if (fd < 0) throw std::runtime_error("proxy connect failed for " + path + ": " + std::strerror(error));
     return fd;
 }
 
@@ -117,8 +158,7 @@ std::string gather_world_json(int rank, int world_size, const std::string &worke
     }
     std::vector<char> names(static_cast<size_t>(world_size) * MPI_MAX_PROCESSOR_NAME, 0);
     if (MPI_Allgather(
-            local_name, MPI_MAX_PROCESSOR_NAME, MPI_CHAR, names.data(), MPI_MAX_PROCESSOR_NAME, MPI_CHAR,
-            MPI_COMM_WORLD
+            local_name, MPI_MAX_PROCESSOR_NAME, MPI_CHAR, names.data(), MPI_MAX_PROCESSOR_NAME, MPI_CHAR, MPI_COMM_WORLD
         ) != MPI_SUCCESS) {
         throw std::runtime_error("MPI_Allgather(hostname) failed");
     }
@@ -142,8 +182,10 @@ void verify_shared_string(const std::string &value, const char *label, int world
     std::vector<char> local(static_cast<size_t>(max_size), 0);
     std::copy(value.begin(), value.end(), local.begin());
     std::vector<char> all(static_cast<size_t>(world_size) * static_cast<size_t>(max_size), 0);
-    MPI_Allgather(local.data(), static_cast<int>(max_size), MPI_CHAR, all.data(), static_cast<int>(max_size), MPI_CHAR,
-                  MPI_COMM_WORLD);
+    MPI_Allgather(
+        local.data(), static_cast<int>(max_size), MPI_CHAR, all.data(), static_cast<int>(max_size), MPI_CHAR,
+        MPI_COMM_WORLD
+    );
     for (int rank = 0; rank < world_size; ++rank) {
         std::string peer(all.data() + static_cast<size_t>(rank) * max_size, static_cast<size_t>(sizes[rank]));
         if (peer != value) throw std::runtime_error(std::string(label) + " differs across MPI ranks");
@@ -192,6 +234,123 @@ void validate_worker_map(const std::string &worker_map, int world_size) {
     }
 }
 
+std::string worker_ids_for_rank(const std::string &worker_map, int target_rank) {
+    size_t entry_start = 0;
+    while (entry_start <= worker_map.size()) {
+        size_t entry_end = worker_map.find(';', entry_start);
+        std::string entry = worker_map.substr(entry_start, entry_end - entry_start);
+        size_t separator = entry.find(':');
+        if (separator == std::string::npos) throw std::invalid_argument("worker map entry is missing ':'");
+        if (parse_nonnegative(entry.substr(0, separator), "worker map rank") == target_rank) {
+            return entry.substr(separator + 1);
+        }
+        if (entry_end == std::string::npos) break;
+        entry_start = entry_end + 1;
+    }
+    throw std::invalid_argument("launcher rank is missing from worker map");
+}
+
+pid_t start_proxy(const Options &options, int rank) {
+    std::vector<std::string> arguments = {
+        options.proxy_python,
+        "-m",
+        "simpler.remote_l3_sidecar_proxy",
+        "--rank",
+        std::to_string(rank),
+        "--sidecar-socket",
+        rank_path(options.proxy_socket_template, rank),
+        "--session-dir",
+        rank_path(options.proxy_session_dir_template, rank),
+        "--worker-ids",
+        worker_ids_for_rank(options.worker_map, rank),
+    };
+    if (rank == 0) {
+        arguments.push_back("--bootstrap-socket");
+        arguments.push_back(options.bootstrap_socket);
+    }
+    pid_t pid = ::fork();
+    if (pid < 0) throw std::runtime_error(std::string("proxy fork failed: ") + std::strerror(errno));
+    if (pid == 0) {
+        if (::prctl(PR_SET_PDEATHSIG, SIGTERM) != 0 || ::getppid() == 1) {
+            std::_Exit(126);
+        }
+        std::vector<char *> argv;
+        argv.reserve(arguments.size() + 1);
+        for (std::string &argument : arguments)
+            argv.push_back(argument.data());
+        argv.push_back(nullptr);
+        ::execvp(argv[0], argv.data());
+        std::cerr << "MPI rank-local proxy exec failed: " << std::strerror(errno) << std::endl;
+        std::_Exit(127);
+    }
+    return pid;
+}
+
+void terminate_proxy(pid_t &pid) {
+    if (pid <= 0) return;
+    if (::kill(pid, SIGTERM) != 0 && errno != ESRCH) {
+        std::cerr << "proxy SIGTERM failed: " << std::strerror(errno) << std::endl;
+    }
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        int status = 0;
+        pid_t result = ::waitpid(pid, &status, WNOHANG);
+        if (result == pid || (result < 0 && errno == ECHILD)) {
+            pid = -1;
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    if (::kill(pid, SIGKILL) != 0 && errno != ESRCH) {
+        std::cerr << "proxy SIGKILL failed: " << std::strerror(errno) << std::endl;
+    }
+    while (::waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {}
+    pid = -1;
+}
+
+int connect_managed_proxy(const std::string &path, pid_t &pid, int timeout_ms) {
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    int error = ENOENT;
+    while (std::chrono::steady_clock::now() < deadline) {
+        int fd = try_connect_proxy(path, &error);
+        if (fd >= 0) return fd;
+        int status = 0;
+        pid_t result = ::waitpid(pid, &status, WNOHANG);
+        if (result == pid) {
+            pid = -1;
+            throw std::runtime_error("rank-local proxy exited before accepting the sidecar connection");
+        }
+        if (result < 0 && errno != EINTR) {
+            throw std::runtime_error(std::string("proxy waitpid failed: ") + std::strerror(errno));
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    throw std::runtime_error("rank-local proxy did not listen at " + path + ": " + std::strerror(error));
+}
+
+void wait_managed_proxy(pid_t &pid, const std::string &proxy_path, int timeout_ms) {
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (std::chrono::steady_clock::now() < deadline) {
+        int status = 0;
+        pid_t result = ::waitpid(pid, &status, WNOHANG);
+        if (result == pid) {
+            pid = -1;
+            if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+                throw std::runtime_error("rank-local proxy exited unsuccessfully");
+            }
+            if (::access(proxy_path.c_str(), F_OK) == 0) {
+                throw std::runtime_error("rank-local proxy left its Unix socket behind");
+            }
+            return;
+        }
+        if (result < 0 && errno != EINTR) {
+            throw std::runtime_error(std::string("proxy waitpid failed: ") + std::strerror(errno));
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    terminate_proxy(pid);
+    throw std::runtime_error("rank-local proxy did not exit within the cleanup deadline");
+}
+
 void progress_sends(std::vector<std::unique_ptr<PendingSend>> &pending) {
     for (auto it = pending.begin(); it != pending.end();) {
         int complete = 0;
@@ -210,13 +369,16 @@ void start_send(std::vector<std::unique_ptr<PendingSend>> &pending, const sideca
     if (send->bytes.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
         throw std::runtime_error("MPI envelope exceeds MPI int count");
     }
-    MPI_Isend(send->bytes.data(), static_cast<int>(send->bytes.size()), MPI_BYTE, envelope.target_rank, ENVELOPE_TAG,
-              MPI_COMM_WORLD, &send->request);
+    MPI_Isend(
+        send->bytes.data(), static_cast<int>(send->bytes.size()), MPI_BYTE, envelope.target_rank, ENVELOPE_TAG,
+        MPI_COMM_WORLD, &send->request
+    );
     pending.push_back(std::move(send));
 }
 
 void wait_sends(std::vector<std::unique_ptr<PendingSend>> &pending) {
-    for (auto &send : pending) MPI_Wait(&send->request, MPI_STATUS_IGNORE);
+    for (auto &send : pending)
+        MPI_Wait(&send->request, MPI_STATUS_IGNORE);
     pending.clear();
 }
 
@@ -244,8 +406,7 @@ int run_loop(int proxy_fd, int rank, int world_size, const std::string &world_js
                 throw std::runtime_error("MPI envelope has invalid size");
             }
             std::vector<uint8_t> bytes(static_cast<size_t>(count));
-            MPI_Recv(bytes.data(), count, MPI_BYTE, status.MPI_SOURCE, ENVELOPE_TAG, MPI_COMM_WORLD,
-                     MPI_STATUS_IGNORE);
+            MPI_Recv(bytes.data(), count, MPI_BYTE, status.MPI_SOURCE, ENVELOPE_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
             sidecar::Envelope envelope = sidecar::decode(bytes.data(), bytes.size());
             if (envelope.source_rank != status.MPI_SOURCE || envelope.target_rank != rank) {
                 throw std::runtime_error("MPI envelope rank metadata mismatch");
@@ -295,14 +456,23 @@ int run_loop(int proxy_fd, int rank, int world_size, const std::string &world_js
 
 int main(int argc, char **argv) {
     int proxy_fd = -1;
+    pid_t proxy_pid = -1;
     bool mpi_initialized = false;
     try {
         Options options = parse_options(argc, argv);
         const char *rank_env = std::getenv("OMPI_COMM_WORLD_RANK");
         if (rank_env == nullptr) rank_env = std::getenv("PMI_RANK");
-        if (rank_env == nullptr) throw std::runtime_error("MPI launcher rank environment is unavailable before MPI_Init");
+        if (rank_env == nullptr) {
+            throw std::runtime_error("MPI launcher rank environment is unavailable before MPI_Init");
+        }
         int launcher_rank = std::stoi(rank_env);
-        proxy_fd = connect_proxy(rank_path(options.proxy_socket_template, launcher_rank));
+        std::string proxy_path = rank_path(options.proxy_socket_template, launcher_rank);
+        if (options.manage_proxy) {
+            proxy_pid = start_proxy(options, launcher_rank);
+            proxy_fd = connect_managed_proxy(proxy_path, proxy_pid, options.proxy_startup_timeout_ms);
+        } else {
+            proxy_fd = connect_proxy(proxy_path);
+        }
 
         int provided = MPI_THREAD_SINGLE;
         if (MPI_Init_thread(&argc, &argv, MPI_THREAD_FUNNELED, &provided) != MPI_SUCCESS) {
@@ -324,10 +494,15 @@ int main(int argc, char **argv) {
         proxy_fd = -1;
         MPI_Finalize();
         mpi_initialized = false;
+        if (options.manage_proxy) {
+            wait_managed_proxy(proxy_pid, proxy_path, options.proxy_startup_timeout_ms);
+            std::cout << "MPI rank " << rank << " proxy cleanup PASS" << std::endl;
+        }
         return result;
     } catch (const std::exception &error) {
         std::cerr << "simpler MPI sidecar failed: " << error.what() << std::endl;
         if (proxy_fd >= 0) ::close(proxy_fd);
+        terminate_proxy(proxy_pid);
         if (mpi_initialized) MPI_Abort(MPI_COMM_WORLD, 1);
         return 1;
     }

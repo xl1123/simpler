@@ -48,4 +48,3 @@ profiling_logs_*/
 # Machine-local MPI L4 sidecar topology
 tools/mpi_l4_sidecar/topology.local.json
 tools/mpi_l4_sidecar/topology.2host.json
-tools/mpi_l4_sidecar/topology.2host-npu.json

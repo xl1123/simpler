@@ -1,12 +1,9 @@
 {
   "python": "/shared/simpler/.venv/bin/python",
-  "mpi_command": [
-    "/opt/mpi/bin/mpirun",
-    "-np",
-    "2",
-    "--host",
-    "master-host,npu-peer-host"
-  ],
+  "mpi": {
+    "implementation": "mpich",
+    "launcher": "/opt/mpi/bin/mpirun"
+  },
   "sidecar_binary": "/shared/simpler/build/mpi_l4_sidecar/simpler-mpi-l4-sidecar",
   "platform": "a2a3",
   "runtime": "tensormap_and_ringbuffer",
@@ -17,16 +14,13 @@
     {
       "rank": 0,
       "local": true,
-      "ssh": "master-host",
-      "repo_root": "/shared/simpler",
+      "mpi_host": "master-host",
       "daemon_endpoint": "10.0.0.1:19073",
       "device_ids": [0, 1]
     },
     {
       "rank": 1,
-      "ssh": "npu-peer-host",
-      "repo_root": "/shared/simpler",
-      "python": "/shared/simpler/.venv/bin/python",
+      "mpi_host": "npu-peer-host",
       "daemon_endpoint": "10.0.0.2:19073",
       "device_ids": [0, 1]
     }

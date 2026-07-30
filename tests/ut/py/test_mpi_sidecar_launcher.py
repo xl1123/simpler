@@ -123,3 +123,71 @@ def test_frame_records_accept_mpi_prefixed_proxy_output(tmp_path):
     )
 
     assert launcher._frame_records(log, "L4_TO_MPI") == {(7, 1, 2, 3, "abc"): 1}
+
+
+def test_npu_mpi_only_skips_socket_case_and_legacy_comparison(tmp_path, monkeypatch, capsys):
+    launcher = _load_launcher()
+    transports = []
+
+    class CompletedSidecar:
+        args = ["mpirun"]
+        returncode = 0
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+    def start_local(command, *, env, log_path, processes, echo_log=False):
+        process = CompletedSidecar()
+        process.args = command
+        processes.append(process)
+        return process
+
+    def run_npu_case(**kwargs):
+        transports.append(kwargs["transport"])
+        return {"status": "PASS", "control_transport": kwargs["transport"]}
+
+    def fail_compare(*args, **kwargs):
+        raise AssertionError("comparison must be skipped")
+
+    monkeypatch.setattr(launcher, "_wait_tcp_endpoint", lambda *args, **kwargs: None)
+    monkeypatch.setattr(launcher, "_start_local", start_local)
+    monkeypatch.setattr(launcher, "_wait_path", lambda *args, **kwargs: None)
+    monkeypatch.setattr(launcher, "_run_npu_case", run_npu_case)
+    monkeypatch.setattr(launcher, "_compare", fail_compare)
+    monkeypatch.setattr(launcher, "_verify_frame_logs", lambda *args, **kwargs: None)
+    monkeypatch.setattr(launcher, "_stop_world", lambda *args, **kwargs: None)
+
+    result = launcher.run_npu(
+        {
+            "python": sys.executable,
+            "mpi_command": ["mpirun", "-np", "2"],
+            "sidecar_binary": "/tmp/simpler-mpi-l4-sidecar",
+            "timeout_s": 1.0,
+            "work_dir": str(tmp_path),
+            "hosts": [
+                {
+                    "rank": 0,
+                    "local": True,
+                    "daemon_endpoint": "127.0.0.1:19072",
+                    "device_ids": [0, 1],
+                },
+                {
+                    "rank": 1,
+                    "daemon_endpoint": "127.0.0.2:19072",
+                    "device_ids": [0, 1],
+                },
+            ],
+        },
+        mpi_only=True,
+    )
+
+    output = capsys.readouterr().out
+    assert result == 0
+    assert transports == ["mpi_sidecar"]
+    assert "socket baseline SKIPPED" in output
+    assert "legacy result comparison SKIPPED" in output
+    assert "MPI-only validation PASS" in output
+    assert not list(tmp_path.rglob("socket-npu-case.log"))

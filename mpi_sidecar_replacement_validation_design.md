@@ -195,6 +195,7 @@ tools/mpi_l4_sidecar/
   run_1host_sim.sh
   run_2host_sim.sh
   run_2host_npu.sh
+  run_2host_npu_mpi_only.sh
   topology.example.json
   topology.2host-npu.json
   topology.2host-npu.example.json
@@ -400,7 +401,23 @@ bash tools/mpi_l4_sidecar/run_2host_npu.sh \
   tools/mpi_l4_sidecar/topology.2host-npu.json
 ```
 
-launcher 对同一个 vector group 用例顺序执行：
+不执行 socket baseline、让 MPI 成为 daemon 冷启动后的第一个真实 NPU 负载：
+
+```bash
+bash tools/mpi_l4_sidecar/run_2host_npu_mpi_only.sh \
+  tools/mpi_l4_sidecar/topology.2host-npu.json
+```
+
+该入口仍要求两机各有一个预启动的 `remote_l3_worker`，但不会创建默认 L4
+socket session，也不会读取 baseline 结果或执行 legacy/MPI 对比。
+从两个 daemon 均未启动的环境出发，本阶段还不是单命令流程，因为 launcher 会在
+`mpirun` 之前检查两个 daemon 的 TCP 端口。若 daemon 已作为 systemd 服务或后台进程
+常驻，则只需在 master 使用一个交互终端运行 MPI-only 脚本。日志中的
+`MPI_TARGET_CONNECT_REMOTE_L3` 和 `REMOTE_L3_SESSION_READY` 会显式标记
+`daemon_transport=tcp`/`runner_transport=tcp`；这是本阶段仍复用 Remote L3 后端的预期
+依赖，不代表默认 L4 socket baseline 被执行。
+
+默认对比入口对同一个 vector group 用例顺序执行：
 
 ```text
 legacy_socket_npu:
@@ -411,10 +428,11 @@ mpi_sidecar_npu:
      -> each submit_next_level_group -> 2 x L2 NPU
 ```
 
-两条路径都必须完成动态 `ChipCallable` prepare/commit、每个 worker 六个 RemoteBuffer 的
-allocate/copy/free、两个 NPU group 执行和 golden 校验。launcher 比较两次运行的 worker
-映射、实际输出 SHA-256、expected 值和 max diff，并聚合 rank 0/1 日志校验 sidecar 两侧
-TASK/CONTROL/COMPLETION 的 sequence/hash。
+MPI-only 入口只执行上面的 `mpi_sidecar_npu`。每条被选中的路径都必须完成动态
+`ChipCallable` prepare/commit、每个 worker 六个 RemoteBuffer 的 allocate/copy/free、
+两个 NPU group 执行和 golden 校验。默认对比入口还比较两次运行的 worker 映射、
+实际输出 SHA-256、expected 值和 max diff；两个入口都会聚合 rank 0/1 日志，校验
+sidecar 两侧 TASK/CONTROL/COMPLETION 的 sequence/hash。
 
 这一步证明的是“MPI 控制面驱动了真实跨机 NPU 计算”。输入/输出仍通过 control frame
 copy；不包含跨机 NPU buffer import/export，也不等价于第三、四阶段的 Fabric 数据面。

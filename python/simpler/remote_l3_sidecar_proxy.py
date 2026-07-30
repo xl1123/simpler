@@ -163,6 +163,10 @@ def _log_frame(event: str, envelope: Envelope) -> None:
     )
 
 
+def _log_event(event: str, **fields: Any) -> None:
+    print(json.dumps({"event": event, **fields}, sort_keys=True), flush=True)
+
+
 def _read_slr3(sock: socket.socket) -> bytes:
     header = _read_exact(sock, SLR3_HEADER_BYTES)
     payload_size = struct.unpack_from("<I", header, 32)[0]
@@ -416,6 +420,15 @@ class SidecarProxy:
             remaining = float(manifest["startup_remaining_s"])
             if remaining <= 0:
                 raise TimeoutError("OPEN_SESSION startup budget is exhausted")
+            _log_event(
+                "L4_OPEN_SESSION_MPI",
+                rank=self.rank,
+                target_rank=target_rank,
+                session_id=session_id,
+                worker_id=int(manifest["worker_id"]),
+                local_transport="unix",
+                cross_machine_transport="mpi",
+            )
             started = time.monotonic()
             pending = _PendingOpen()
             with self._state_lock:
@@ -521,6 +534,15 @@ class SidecarProxy:
                 raise TimeoutError("target startup budget is exhausted")
             daemon_host = str(request["daemon_host"])
             daemon_port = int(request["daemon_port"])
+            _log_event(
+                "MPI_TARGET_CONNECT_REMOTE_L3",
+                rank=self.rank,
+                source_rank=envelope.source_rank,
+                session_id=envelope.session_id,
+                worker_id=worker_id,
+                daemon_endpoint=f"{daemon_host}:{daemon_port}",
+                daemon_transport="tcp",
+            )
             started = time.monotonic()
             daemon = socket.create_connection((daemon_host, daemon_port), timeout=timeout)
             with daemon:
@@ -560,6 +582,17 @@ class SidecarProxy:
                 self._targets[envelope.session_id] = session
                 session_registered = True
             assert session is not None
+            _log_event(
+                "REMOTE_L3_SESSION_READY",
+                rank=self.rank,
+                source_rank=envelope.source_rank,
+                session_id=envelope.session_id,
+                worker_id=worker_id,
+                pid=session.pid,
+                command_endpoint=f"{reply['command_host']}:{reply['command_port']}",
+                health_endpoint=f"{reply['health_host']}:{reply['health_port']}",
+                runner_transport="tcp",
+            )
             result = {"ok": True, "worker_id": worker_id, "pid": session.pid}
             self._send_message(
                 MessageType.OPEN_SESSION_REPLY,
@@ -598,6 +631,15 @@ class SidecarProxy:
             try:
                 worker_id = int(reply["worker_id"])
                 session = self._create_source_session(envelope.session_id, worker_id, envelope.source_rank)
+                _log_event(
+                    "L4_SESSION_UDS_READY",
+                    rank=self.rank,
+                    target_rank=envelope.source_rank,
+                    session_id=envelope.session_id,
+                    worker_id=worker_id,
+                    command_path=session.command_path,
+                    health_path=session.health_path,
+                )
                 reply = {
                     "ok": True,
                     "command_path": session.command_path,

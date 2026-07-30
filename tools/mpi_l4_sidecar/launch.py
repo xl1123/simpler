@@ -691,10 +691,14 @@ def run_two_host(config: dict[str, Any]) -> int:
             _terminate(process)
 
 
-def run_npu(config: dict[str, Any]) -> int:
+def run_npu(config: dict[str, Any], *, mpi_only: bool = False) -> int:
     python, mpi_command, sidecar_binary, timeout_s = _validate_common(
         config, allow_derived_mpi_command=True
     )
+    if mpi_only:
+        _status("execution mode: MPI-only; socket baseline and legacy comparison are disabled")
+    else:
+        _status("execution mode: socket baseline followed by MPI-sidecar comparison")
     hosts = config.get("hosts")
     if not isinstance(hosts, list) or len(hosts) != 2:
         raise ValueError("NPU config requires exactly two machine/rank entries")
@@ -766,19 +770,23 @@ def run_npu(config: dict[str, Any]) -> int:
         )
         _status("MPI world/L4 bootstrap READY")
 
-        _status("starting baseline socket control-path NPU case")
-        legacy = _run_npu_case(
-            python=python,
-            env=env,
-            transport="socket",
-            remotes=remotes,
-            bootstrap_path=bootstrap_path,
-            platform=platform,
-            runtime=runtime,
-            timeout_s=timeout_s,
-            log_path=job_dir / "socket-npu-case.log",
-        )
-        _status("baseline socket control-path NPU case PASS")
+        legacy: dict[str, Any] | None = None
+        if mpi_only:
+            _status("socket baseline SKIPPED; starting MPI as the first NPU workload after bootstrap")
+        else:
+            _status("starting baseline socket control-path NPU case")
+            legacy = _run_npu_case(
+                python=python,
+                env=env,
+                transport="socket",
+                remotes=remotes,
+                bootstrap_path=bootstrap_path,
+                platform=platform,
+                runtime=runtime,
+                timeout_s=timeout_s,
+                log_path=job_dir / "socket-npu-case.log",
+            )
+            _status("baseline socket control-path NPU case PASS")
         _status("starting MPI-sidecar control-path NPU case")
         mpi = _run_npu_case(
             python=python,
@@ -792,8 +800,13 @@ def run_npu(config: dict[str, Any]) -> int:
             log_path=job_dir / "mpi-sidecar-npu-case.log",
         )
         _status("MPI-sidecar control-path NPU case PASS")
-        _compare(legacy, mpi)
+        if legacy is None:
+            _status("legacy result comparison SKIPPED; MPI result is standalone")
+        else:
+            _compare(legacy, mpi)
+        _status("validating MPI command frame sequence/hash in both directions")
         _verify_frame_logs(sidecar_log, [sidecar_log])
+        _status("MPI command frame sequence/hash validation PASS")
         _status("stopping MPI world")
         _stop_world(python, env, bootstrap_path, timeout_s)
         sidecar.wait(timeout=timeout_s)
@@ -802,7 +815,11 @@ def run_npu(config: dict[str, Any]) -> int:
         residue = list(job_dir.rglob("*.sock"))
         if residue:
             raise RuntimeError(f"Unix socket residue remains: {residue}")
-        print(f"two-machine master real-NPU MPI sidecar phase-1 validation PASS; logs: {job_dir}")
+        _status("MPI ranks, proxies, sessions, and Unix sockets cleaned up")
+        if mpi_only:
+            print(f"two-machine master real-NPU MPI-only validation PASS; logs: {job_dir}")
+        else:
+            print(f"two-machine master real-NPU MPI sidecar phase-1 validation PASS; logs: {job_dir}")
         return 0
     finally:
         for process in reversed(processes):
@@ -813,13 +830,16 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=("one-host", "two-host", "npu"), required=True)
     parser.add_argument("--config", required=True)
+    parser.add_argument("--mpi-only", action="store_true")
     ns = parser.parse_args(argv)
+    if ns.mpi_only and ns.mode != "npu":
+        parser.error("--mpi-only is only valid with --mode npu")
     config = _load_config(ns.config)
     if ns.mode == "one-host":
         return run_one_host(config)
     if ns.mode == "two-host":
         return run_two_host(config)
-    return run_npu(config)
+    return run_npu(config, mpi_only=ns.mpi_only)
 
 
 if __name__ == "__main__":

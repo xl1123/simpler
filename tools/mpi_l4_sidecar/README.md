@@ -127,6 +127,47 @@ bash tools/mpi_l4_sidecar/run_2host_npu.sh \
   tools/mpi_l4_sidecar/topology.2host-npu.json
 ```
 
+To verify that the MPI path starts and completes without running or consuming
+the socket baseline first, keep both remote L3 daemons running and use the
+MPI-only entry point:
+
+```bash
+bash tools/mpi_l4_sidecar/run_2host_npu_mpi_only.sh \
+  tools/mpi_l4_sidecar/topology.2host-npu.json
+```
+
+This mode prints explicit `socket baseline SKIPPED` and
+`legacy result comparison SKIPPED` markers. MPI is the first NPU workload after
+the sidecar world becomes ready. It still requires one pre-started
+`remote_l3_worker` on each host because the rank-local proxies share the normal
+Remote L3 daemon/session backend. The launcher does not manage those daemons.
+They may run as services or background processes, so three interactive
+terminals are not a protocol requirement, but three process roles remain.
+From two clean hosts with neither daemon running, this launcher is not yet a
+one-command workflow: daemon readiness is checked before `mpirun` starts. With
+both daemons provisioned as services, only one interactive terminal on the
+master is needed.
+
+The important live markers are:
+
+```text
+execution mode: MPI-only; socket baseline and legacy comparison are disabled
+rank 0 remote L3 daemon READY
+rank 1 remote L3 daemon READY
+MPI world/L4 bootstrap READY
+socket baseline SKIPPED
+{"event": "L4_OPEN_SESSION_MPI", ..., "cross_machine_transport": "mpi"}
+{"event": "MPI_TARGET_CONNECT_REMOTE_L3", ..., "daemon_transport": "tcp"}
+{"event": "REMOTE_L3_SESSION_READY", ..., "runner_transport": "tcp"}
+{"event": "L4_SESSION_UDS_READY", ...}
+MPI command frame sequence/hash validation PASS
+two-machine master real-NPU MPI-only validation PASS
+```
+
+The two events that name TCP are expected in phase 1. They expose the remaining
+rank-local proxy-to-Remote-L3 backend dependency; they do not indicate that the
+default L4 socket baseline ran.
+
 The launcher leaves the two pre-existing daemons running. One `mpirun` starts
 both sidecar ranks; each rank starts and owns its local Python proxy. There is
 no separate Simpler SSH command or `hosts[].ssh` topology field. On bare hosts,
@@ -138,13 +179,15 @@ As in `mpirun-test`, the launcher creates a per-run hostfile. MPICH uses
 hostfile with `-np 2`. The legacy full `mpi_command` array remains accepted,
 but `mpi` plus `mpi_host` is the preferred NPU configuration.
 
-The launcher first executes the real NPU task through the default TCP control
-path, then executes the same task through UDS/MPI P2P. Both runs dynamically install the same `ChipCallable`,
-allocate/copy/free the same remote buffers, submit the same two-device L3 group,
-and validate the same golden values. It also compares output SHA-256 records and
-aggregates frame sequence/hash records from the combined MPI output. Each rank
-waits for its local proxy to exit and rejects a leftover proxy UDS before the
-MPI job can report success.
+The comparison entry point first executes the real NPU task through the default
+TCP control path, then executes the same task through UDS/MPI P2P. The MPI-only
+entry point executes only the latter. Each selected run dynamically installs
+the same `ChipCallable`, allocates/copies/frees the same remote buffers, submits
+the same two-device L3 group, and validates the same golden values. Comparison
+mode also compares output SHA-256 records. Both modes aggregate frame
+sequence/hash records from the combined MPI output. Each rank waits for its
+local proxy to exit and rejects a leftover proxy UDS before the MPI job can
+report success.
 
 `transport="sim"` in the NPU case remains the remote-buffer transport profile;
 it does not select an L2 simulator. `platform="a2a3"` plus the two `device_ids`

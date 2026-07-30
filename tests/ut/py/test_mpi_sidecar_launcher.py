@@ -113,6 +113,27 @@ def test_npu_case_routes_group_to_both_local_l2_workers():
     assert ast.literal_eval(workers) == [0, 1]
 
 
+def test_npu_case_defaults_to_one_block_for_vector_smoke():
+    root = Path(__file__).resolve().parents[3]
+    source = (root / "tools/mpi_l4_sidecar/npu_e2e_case.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    main = next(
+        node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "main"
+    )
+    block_dim_arg = next(
+        node
+        for node in ast.walk(main)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "add_argument"
+        and node.args
+        and ast.literal_eval(node.args[0]) == "--block-dim"
+    )
+    default = next(keyword.value for keyword in block_dim_arg.keywords if keyword.arg == "default")
+
+    assert ast.literal_eval(default) == 1
+
+
 def test_frame_records_accept_mpi_prefixed_proxy_output(tmp_path):
     launcher = _load_launcher()
     log = tmp_path / "sidecar.log"
@@ -128,6 +149,7 @@ def test_frame_records_accept_mpi_prefixed_proxy_output(tmp_path):
 def test_npu_mpi_only_skips_socket_case_and_legacy_comparison(tmp_path, monkeypatch, capsys):
     launcher = _load_launcher()
     transports = []
+    block_dims = []
 
     class CompletedSidecar:
         args = ["mpirun"]
@@ -147,6 +169,7 @@ def test_npu_mpi_only_skips_socket_case_and_legacy_comparison(tmp_path, monkeypa
 
     def run_npu_case(**kwargs):
         transports.append(kwargs["transport"])
+        block_dims.append(kwargs["block_dim"])
         return {"status": "PASS", "control_transport": kwargs["transport"]}
 
     def fail_compare(*args, **kwargs):
@@ -187,6 +210,7 @@ def test_npu_mpi_only_skips_socket_case_and_legacy_comparison(tmp_path, monkeypa
     output = capsys.readouterr().out
     assert result == 0
     assert transports == ["mpi_sidecar"]
+    assert block_dims == [1]
     assert "socket baseline SKIPPED" in output
     assert "legacy result comparison SKIPPED" in output
     assert "MPI-only validation PASS" in output

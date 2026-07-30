@@ -168,6 +168,12 @@ The two events that name TCP are expected in phase 1. They expose the remaining
 rank-local proxy-to-Remote-L3 backend dependency; they do not indicate that the
 default L4 socket baseline ran.
 
+The real-NPU vector smoke defaults to `block_dim: 1`. Its kernel processes the
+complete tensor in one block and does not partition work by block index, so
+launching three redundant blocks adds no validation coverage and has produced
+non-zero-block UB-address faults on A3. Set `block_dim` in the topology only
+when testing a kernel that explicitly supports that launch shape.
+
 The launcher leaves the two pre-existing daemons running. One `mpirun` starts
 both sidecar ranks; each rank starts and owns its local Python proxy. There is
 no separate Simpler SSH command or `hosts[].ssh` topology field. On bare hosts,

@@ -7,6 +7,7 @@
   "sidecar_binary": "/home/x00611368/PTO/mpirun_l4/build/mpi_l4_sidecar/simpler-mpi-l4-sidecar",
   "platform": "a2a3",
   "runtime": "tensormap_and_ringbuffer",
+  "block_dim": 1,
   "timeout_s": 300,
   "work_dir": "/tmp",
   "topology_id": "120.9.10.37-120.9.10.35-real-npu-phase1",

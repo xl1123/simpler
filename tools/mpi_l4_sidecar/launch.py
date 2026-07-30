@@ -229,6 +229,7 @@ def _run_npu_case(
     bootstrap_path: Path,
     platform: str,
     runtime: str,
+    block_dim: int,
     timeout_s: float,
     log_path: Path,
 ) -> dict[str, Any]:
@@ -253,6 +254,8 @@ def _run_npu_case(
         platform,
         "--runtime",
         runtime,
+        "--block-dim",
+        str(block_dim),
         "--timeout",
         str(timeout_s),
     ]
@@ -737,6 +740,10 @@ def run_npu(config: dict[str, Any], *, mpi_only: bool = False) -> int:
     session_dir_template = str(job_dir / "sessions.%r")
     platform = str(config.get("platform", "a2a3"))
     runtime = str(config.get("runtime", "tensormap_and_ringbuffer"))
+    block_dim = int(config.get("block_dim", 1))
+    if block_dim <= 0:
+        raise ValueError("NPU config.block_dim must be positive")
+    _status(f"NPU case block_dim: {block_dim}")
     env = _python_env(str(REPO_ROOT))
     processes: list[subprocess.Popen[Any]] = []
     try:
@@ -783,6 +790,7 @@ def run_npu(config: dict[str, Any], *, mpi_only: bool = False) -> int:
                 bootstrap_path=bootstrap_path,
                 platform=platform,
                 runtime=runtime,
+                block_dim=block_dim,
                 timeout_s=timeout_s,
                 log_path=job_dir / "socket-npu-case.log",
             )
@@ -796,6 +804,7 @@ def run_npu(config: dict[str, Any], *, mpi_only: bool = False) -> int:
             bootstrap_path=bootstrap_path,
             platform=platform,
             runtime=runtime,
+            block_dim=block_dim,
             timeout_s=timeout_s,
             log_path=job_dir / "mpi-sidecar-npu-case.log",
         )

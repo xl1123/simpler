@@ -253,9 +253,13 @@ def run_case(ns: argparse.Namespace) -> dict[str, object]:
             orch.submit_next_level(remote_handle, args_b, cfg, worker=worker_b)
 
         config = CallConfig()
-        config.block_dim = 3
+        config.block_dim = ns.block_dim
         config.aicpu_thread_num = 4
-        print(f"[npu-case:{ns.control_transport}] submitting cross-machine NPU task", flush=True)
+        print(
+            f"[npu-case:{ns.control_transport}] submitting cross-machine NPU task "
+            f"with block_dim={ns.block_dim}",
+            flush=True,
+        )
         worker.run(parent_orch, config=config)
 
         print(f"[npu-case:{ns.control_transport}] reading and checking NPU outputs", flush=True)
@@ -286,6 +290,7 @@ def run_case(ns: argparse.Namespace) -> dict[str, object]:
             "remote_l3": True,
             "inner_l2_npu": True,
             "elements": ELEMENTS,
+            "block_dim": ns.block_dim,
             "max_diff": max_diff,
             "outputs": output_records,
         }
@@ -311,9 +316,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sidecar-endpoint")
     parser.add_argument("--platform", default="a2a3")
     parser.add_argument("--runtime", default="tensormap_and_ringbuffer")
+    parser.add_argument("--block-dim", type=int, default=1)
     parser.add_argument("--session-listen-host", default="0.0.0.0")
     parser.add_argument("--timeout", type=float, default=300.0)
     ns = parser.parse_args(argv)
+    if ns.block_dim <= 0:
+        parser.error("--block-dim must be positive")
     if ns.control_transport == "mpi_sidecar" and not ns.sidecar_endpoint:
         parser.error("--sidecar-endpoint is required for mpi_sidecar")
     print(json.dumps(run_case(ns), sort_keys=True), flush=True)

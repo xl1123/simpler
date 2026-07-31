@@ -16,6 +16,7 @@ only when the full mpirun group participates in one Global CommDomain prepare.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import signal
@@ -140,7 +141,9 @@ def _raise_keyboard_interrupt(_signum, _frame):
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--group-manifest", required=True)
+    manifest_group = parser.add_mutually_exclusive_group(required=True)
+    manifest_group.add_argument("--group-manifest")
+    manifest_group.add_argument("--group-manifest-json")
     ns = parser.parse_args(argv)
 
     signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
@@ -153,8 +156,11 @@ def main(argv: list[str] | None = None) -> int:
     rank = int(comm.Get_rank())
     world_size = int(comm.Get_size())
 
-    with open(ns.group_manifest, encoding="utf-8") as f:
-        group_manifest = json.load(f)
+    if ns.group_manifest_json:
+        group_manifest = json.loads(base64.b64decode(ns.group_manifest_json).decode("utf-8"))
+    else:
+        with open(ns.group_manifest, encoding="utf-8") as f:
+            group_manifest = json.load(f)
     rank_manifests = group_manifest.get("rank_manifests")
     if not isinstance(rank_manifests, list):
         raise ValueError("MPI L3 group manifest requires a rank_manifests list")

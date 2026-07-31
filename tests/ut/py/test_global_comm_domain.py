@@ -14,6 +14,7 @@ import socket
 import subprocess
 import sys
 import time
+from collections import Counter
 
 import pytest
 from simpler.global_comm_domain import (
@@ -173,6 +174,27 @@ def _failure_injection_worker(*, platform: str = "a2a3sim", profile: str = "sim"
     return worker, resources, node_ids
 
 
+def _mpi_static_worker():
+    from simpler.worker import MpiL3GroupSpec, Worker, _RunResources  # noqa: PLC0415
+
+    worker = Worker(level=4, num_sub_workers=0)
+    node_ids = worker.add_mpirun_worker_group(
+        MpiL3GroupSpec(
+            hosts=("127.0.0.1", "127.0.0.1"),
+            platform="a2a3sim",
+            command_port_base=21073,
+            health_port_base=22073,
+            device_ids_by_rank=((0,), (0,)),
+            comm_profile="sim",
+            global_device_ranks_by_rank=((0,), (1,)),
+        )
+    )
+    resources = _RunResources()
+    worker._worker = object()
+    worker._building_run_resources = resources
+    return worker, resources, node_ids
+
+
 def _install_global_domain_failure_injector(monkeypatch, worker, *, fail_phase, fail_node):
     from simpler.remote_l3_protocol import ControlName  # noqa: PLC0415
 
@@ -214,6 +236,69 @@ def _install_global_domain_failure_injector(monkeypatch, worker, *, fail_phase, 
 
     monkeypatch.setattr(worker, "_global_domain_control", control)
     return calls
+
+
+def test_mpirun_group_global_domain_uses_mpi_prepare_commit_without_l4_import(monkeypatch):
+    from simpler.remote_l3_protocol import ControlName  # noqa: PLC0415
+    from simpler.task_interface import CommBufferSpec  # noqa: PLC0415
+
+    worker, resources, node_ids = _mpi_static_worker()
+    calls = []
+
+    def control(worker_id, control_name, payload):
+        control_name = ControlName(control_name)
+        if control_name is ControlName.COMM_INIT:
+            init = decode_comm_init(payload)
+            calls.append(("COMM_INIT", worker_id))
+            return encode_comm_init_result(
+                resolve_global_comm_capability(
+                    platform="a2a3sim",
+                    profile=init.profile,
+                    local_device_count=1,
+                )
+            )
+        assert control_name is ControlName.ALLOC_DOMAIN
+        command = decode_domain_command(payload)
+        calls.append((command.phase, worker_id))
+        if command.phase is GlobalDomainPhase.PREPARE_EXPORT:
+            descriptors = tuple(
+                GlobalDomainDescriptor(
+                    version=GLOBAL_DOMAIN_VERSION,
+                    profile_id=GLOBAL_DOMAIN_PROFILE_IDS[command.profile],
+                    domain_rank=member.domain_rank,
+                    rank_count=len(command.members),
+                    mapping_size=4096,
+                    handle=f"/mpi-prepared-{member.domain_rank}".encode(),
+                )
+                for member in command.members
+            )
+            return encode_descriptor_table(descriptors)
+        if command.phase is GlobalDomainPhase.IMPORT:
+            raise RuntimeError("L4 broker IMPORT should not run for a full mpirun group")
+        return b""
+
+    monkeypatch.setattr(worker, "_global_domain_control", control)
+    try:
+        handle = worker._allocate_global_domain(
+            name="mpi-static",
+            members=((node_ids[0], 0), (node_ids[1], 0)),
+            window_size=4096,
+            buffers=[CommBufferSpec("payload", "uint8", 4096, 4096)],
+            retain_after_run=False,
+        )
+
+        assert handle.mapping_size == 4096
+        assert handle.members[0].global_device_rank == 0
+        assert handle.members[1].global_device_rank == 1
+        counts = Counter(phase for phase, _worker_id in calls)
+        assert counts["COMM_INIT"] == 2
+        assert counts[GlobalDomainPhase.PREPARE_EXPORT] == 2
+        assert counts[GlobalDomainPhase.COMMIT] == 2
+        assert counts[GlobalDomainPhase.IMPORT] == 0
+        assert worker._live_global_domains["mpi-static"] is handle
+        assert resources.live_global_domains["mpi-static"] is handle
+    finally:
+        _close_failure_injection_worker(worker, resources)
 
 
 def _close_failure_injection_worker(worker, resources):

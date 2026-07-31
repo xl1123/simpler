@@ -43,6 +43,7 @@ from .callable_identity import (
     validate_hashid,
 )
 from .global_comm_domain import (
+    GlobalDomainCommand,
     GlobalDomainPhase,
     GlobalDomainReleaseCommand,
     decode_comm_init,
@@ -171,10 +172,10 @@ def _load_import_target(target: str) -> Callable[..., Any]:
     return obj
 
 
-def _bind_listener(host: str) -> socket.socket:
+def _bind_listener(host: str, port: int = 0) -> socket.socket:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind((host, 0))
+    sock.bind((host, int(port)))
     sock.listen(1)
     return sock
 
@@ -569,6 +570,7 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
     inner_worker: Worker,
     manifest_inner_handles: dict[tuple[CallableKind, bytes], CallableHandle] | None = None,
     manifest_dispatch_registry: dict[bytes, Callable[..., Any]] | None = None,
+    global_domain_prepare_import: Callable[[GlobalDomainCommand, Worker, int], bytes | None] | None = None,
 ) -> None:
     session_id = int(manifest["session_id"])
     worker_id = int(manifest["worker_id"])
@@ -947,14 +949,21 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                         if command.phase is GlobalDomainPhase.PREPARE_EXPORT:
                             if command.descriptors:
                                 raise ValueError("PREPARE_EXPORT must not carry descriptors")
-                            descriptors = inner_worker._prepare_global_domain_node(command, worker_id)  # noqa: SLF001
+                            result = (
+                                global_domain_prepare_import(command, inner_worker, worker_id)
+                                if global_domain_prepare_import is not None
+                                else None
+                            )
+                            if result is None:
+                                descriptors = inner_worker._prepare_global_domain_node(command, worker_id)  # noqa: SLF001
+                                result = encode_descriptor_table(descriptors)
                             _control_result_reply(
                                 conn,
                                 manifest,
                                 header.sequence,
                                 control.control_name,
                                 control.control_version,
-                                encode_descriptor_table(descriptors),
+                                result,
                             )
                         elif command.phase is GlobalDomainPhase.IMPORT:
                             inner_worker._import_global_domain_node(command, worker_id)  # noqa: SLF001
@@ -1093,7 +1102,13 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
             _INNER_HANDLES.clear()
 
 
-def run_session(manifest: dict[str, Any], ready_fd: int) -> int:
+def run_session(
+    manifest: dict[str, Any],
+    ready_fd: int | None,
+    *,
+    ready_writer: Callable[[dict[str, Any]], None] | None = None,
+    global_domain_prepare_import: Callable[[GlobalDomainCommand, Worker, int], bytes | None] | None = None,
+) -> int:
     inner_worker = Worker(
         level=3,
         platform=str(manifest["platform"]),
@@ -1106,6 +1121,16 @@ def run_session(manifest: dict[str, Any], ready_fd: int) -> int:
     health_sock: socket.socket | None = None
     stop_health = threading.Event()
     health_thread: threading.Thread | None = None
+    ready_sent = False
+
+    def _publish_ready(payload: dict[str, Any]) -> None:
+        nonlocal ready_sent
+        if ready_writer is not None:
+            ready_writer(payload)
+        elif ready_fd is not None:
+            _send_ready(ready_fd, payload)
+        ready_sent = True
+
     try:
         # Validate the runtime command timeout wire value up front (rejects a
         # malformed session_timeout_s); the command lane itself idle-waits blocking.
@@ -1131,8 +1156,8 @@ def run_session(manifest: dict[str, Any], ready_fd: int) -> int:
         inner_worker.init(_startup_deadline=startup_deadline)
 
         listen_host = str(manifest.get("listen_host", "127.0.0.1"))
-        command_sock = _bind_listener(listen_host)
-        health_sock = _bind_listener(listen_host)
+        command_sock = _bind_listener(listen_host, int(manifest.get("command_port", 0) or 0))
+        health_sock = _bind_listener(listen_host, int(manifest.get("health_port", 0) or 0))
         health_thread = threading.Thread(
             target=_health_loop,
             args=(health_sock, stop_health, int(manifest["session_id"]), int(manifest["worker_id"])),
@@ -1142,8 +1167,7 @@ def run_session(manifest: dict[str, Any], ready_fd: int) -> int:
 
         command_port = int(command_sock.getsockname()[1])
         health_port = int(health_sock.getsockname()[1])
-        _send_ready(
-            ready_fd,
+        _publish_ready(
             {
                 "ok": True,
                 "command_host": str(manifest.get("connect_host", listen_host)),
@@ -1170,13 +1194,21 @@ def run_session(manifest: dict[str, Any], ready_fd: int) -> int:
         # parent closes the command socket (read_frame sees EOF).
         conn.settimeout(None)
         with conn:
-            _run_command_loop(conn, manifest, inner_worker, manifest_inner_handles, manifest_dispatch_registry)
+            _run_command_loop(
+                conn,
+                manifest,
+                inner_worker,
+                manifest_inner_handles,
+                manifest_dispatch_registry,
+                global_domain_prepare_import,
+            )
         return 0
     except BaseException as exc:  # noqa: BLE001
-        try:
-            _send_ready(ready_fd, {"ok": False, "error": _format_remote_error("remote session startup", exc)})
-        except OSError:
-            pass
+        if not ready_sent:
+            try:
+                _publish_ready({"ok": False, "error": _format_remote_error("remote session startup", exc)})
+            except OSError:
+                pass
         return 1
     finally:
         stop_health.set()

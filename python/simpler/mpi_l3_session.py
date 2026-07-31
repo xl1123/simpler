@@ -16,7 +16,6 @@ only when the full mpirun group participates in one Global CommDomain prepare.
 from __future__ import annotations
 
 import argparse
-import base64
 import json
 import os
 import signal
@@ -139,11 +138,27 @@ def _raise_keyboard_interrupt(_signum, _frame):
     raise KeyboardInterrupt
 
 
+def _load_group_manifest_from_rank0(comm: Any, manifest_path: str) -> dict[str, Any]:
+    rank = int(comm.Get_rank())
+    if rank == 0:
+        try:
+            with open(manifest_path, encoding="utf-8") as f:
+                payload = (True, json.load(f))
+        except BaseException as exc:  # noqa: BLE001
+            payload = (False, f"{type(exc).__name__}: {exc}")
+    else:
+        payload = None
+    ok, value = comm.bcast(payload, root=0)
+    if not ok:
+        raise RuntimeError(f"MPI L3 rank0 failed to read group manifest {manifest_path!r}: {value}")
+    if not isinstance(value, dict):
+        raise ValueError("MPI L3 group manifest broadcast returned a non-object payload")
+    return value
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
-    manifest_group = parser.add_mutually_exclusive_group(required=True)
-    manifest_group.add_argument("--group-manifest")
-    manifest_group.add_argument("--group-manifest-json")
+    parser.add_argument("--group-manifest", required=True)
     ns = parser.parse_args(argv)
 
     signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
@@ -156,11 +171,7 @@ def main(argv: list[str] | None = None) -> int:
     rank = int(comm.Get_rank())
     world_size = int(comm.Get_size())
 
-    if ns.group_manifest_json:
-        group_manifest = json.loads(base64.b64decode(ns.group_manifest_json).decode("utf-8"))
-    else:
-        with open(ns.group_manifest, encoding="utf-8") as f:
-            group_manifest = json.load(f)
+    group_manifest = _load_group_manifest_from_rank0(comm, ns.group_manifest)
     rank_manifests = group_manifest.get("rank_manifests")
     if not isinstance(rank_manifests, list):
         raise ValueError("MPI L3 group manifest requires a rank_manifests list")

@@ -59,7 +59,6 @@ Usage::
 
 from __future__ import annotations
 
-import base64
 import bisect
 import contextlib
 import ctypes
@@ -3745,8 +3744,6 @@ class Worker:
             with open(manifest_path, "w", encoding="utf-8") as f:
                 json.dump(group_manifest, f, sort_keys=True)
                 f.write("\n")
-            manifest_json = json.dumps(group_manifest, sort_keys=True).encode("utf-8")
-            manifest_json_b64 = base64.b64encode(manifest_json).decode("ascii")
 
             cmd = [group.spec.mpirun_path, "-np", str(len(group.ranks))]
             if not self._mpirun_args_select_hosts(group.spec.mpirun_args):
@@ -3757,8 +3754,8 @@ class Worker:
                     group.spec.python_executable,
                     "-m",
                     "simpler.mpi_l3_session",
-                    "--group-manifest-json",
-                    manifest_json_b64,
+                    "--group-manifest",
+                    manifest_path,
                 ]
             )
             group.process = subprocess.Popen(cmd)

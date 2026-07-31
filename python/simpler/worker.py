@@ -527,6 +527,8 @@ class MpiL3GroupSpec:
     session_listen_hosts: tuple[str, ...] = ()
     connect_hosts: tuple[str, ...] = ()
     allow_wildcard_session_bind: bool = False
+    ready_host: str = ""
+    ready_port: int = 0
     mpirun_path: str = "mpirun"
     mpirun_args: tuple[str, ...] = ()
     python_executable: str = field(default_factory=lambda: sys.executable)
@@ -581,6 +583,10 @@ class MpiL3GroupSpec:
         last_health_port = health_port_base + len(hosts) - 1
         if command_port_base <= 0 or health_port_base <= 0 or last_command_port > 65535 or last_health_port > 65535:
             raise ValueError("MpiL3GroupSpec command/health port ranges must be within 1..65535")
+        ready_host = str(self.ready_host)
+        ready_port = int(self.ready_port)
+        if ready_port < 0 or ready_port > 65535:
+            raise ValueError("MpiL3GroupSpec.ready_port must be within 0..65535")
         if self.transport != "sim":
             raise ValueError("MpiL3GroupSpec.transport must be 'sim' for the TCP control plane")
         if self.comm_profile not in GLOBAL_DOMAIN_PROFILE_IDS:
@@ -606,6 +612,8 @@ class MpiL3GroupSpec:
         object.__setattr__(self, "command_port_base", command_port_base)
         object.__setattr__(self, "health_port_base", health_port_base)
         object.__setattr__(self, "allow_wildcard_session_bind", bool(self.allow_wildcard_session_bind))
+        object.__setattr__(self, "ready_host", ready_host)
+        object.__setattr__(self, "ready_port", ready_port)
         object.__setattr__(self, "mpirun_path", str(self.mpirun_path))
         object.__setattr__(self, "mpirun_args", tuple(str(arg) for arg in self.mpirun_args))
         object.__setattr__(self, "python_executable", str(self.python_executable))
@@ -3123,6 +3131,8 @@ class Worker:
                 raise TypeError("Worker.add_mpirun_worker_group expects a MpiL3GroupSpec")
             for host in spec.connect_hosts:
                 self._validate_numeric_endpoint_host(host)
+            if spec.ready_host:
+                self._validate_numeric_endpoint_host(spec.ready_host)
             seen_listeners: set[tuple[str, int]] = set()
             for rank, listen_host in enumerate(spec.session_listen_hosts):
                 if self._is_wildcard_session_host(listen_host):
@@ -3605,6 +3615,53 @@ class Worker:
                 time.sleep(min(0.05, remaining))
         return ready
 
+    @staticmethod
+    def _open_mpi_ready_listener(host: str, port: int) -> socket.socket:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((host, int(port)))
+            sock.listen()
+            return sock
+        except BaseException:
+            sock.close()
+            raise
+
+    def _wait_mpi_ready_tcp(
+        self,
+        group: _MpiL3GroupRuntime,
+        ready_sock: socket.socket,
+        ready_token: str,
+        deadline: float,
+    ) -> dict[int, dict[str, Any]]:
+        pending = {rank.rank for rank in group.ranks}
+        ready: dict[int, dict[str, Any]] = {}
+        while pending:
+            if group.process is not None and group.process.poll() is not None:
+                raise RuntimeError(
+                    f"MPI L3 group {group.group_id} exited before ranks became ready "
+                    f"(status {group.process.returncode})"
+                )
+            ready_sock.settimeout(min(0.2, self._remaining_until(deadline, "MPI L3 TCP ready")))
+            try:
+                conn, _addr = ready_sock.accept()
+            except TimeoutError:
+                continue
+            except socket.timeout:
+                continue
+            with conn:
+                payload = self._recv_remote_daemon_json(conn, deadline)
+            rank_value = int(payload.get("mpi_rank", -1))
+            if payload.get("ready_token") != ready_token:
+                raise RuntimeError("MPI L3 rank published ready with an unexpected token")
+            if rank_value not in pending:
+                raise RuntimeError(f"MPI L3 rank published duplicate or unexpected ready rank={rank_value}")
+            if not payload.get("ok", False):
+                raise RuntimeError(f"MPI L3 rank {rank_value} startup failed: {payload.get('error')}")
+            ready[rank_value] = payload
+            pending.remove(rank_value)
+        return ready
+
     def _close_mpirun_groups(self, *, timeout_s: float = _ROLLBACK_GRACEFUL_TIMEOUT_S) -> None:
         for group in reversed(self._mpi_l3_groups):
             proc = group.process
@@ -3635,6 +3692,13 @@ class Worker:
             manifest_path = os.path.join(ready_dir, "group.json")
             group.ready_dir = ready_dir
             group.manifest_path = manifest_path
+            ready_sock: socket.socket | None = None
+            ready_token = uuid.uuid4().hex
+            ready_host = group.spec.ready_host
+            ready_port = 0
+            if ready_host:
+                ready_sock = self._open_mpi_ready_listener(ready_host, group.spec.ready_port)
+                ready_port = int(ready_sock.getsockname()[1])
             rank_manifests: list[dict[str, Any]] = []
             sessions: dict[int, _RemoteSession] = {}
             startup_remaining_s = self._remaining_until(deadline, "MPI L3 group manifest")
@@ -3672,6 +3736,9 @@ class Worker:
                 "world_size": len(group.ranks),
                 "worker_ids": [rank.worker_id for rank in group.ranks],
                 "ready_dir": ready_dir,
+                "ready_host": ready_host,
+                "ready_port": ready_port,
+                "ready_token": ready_token,
                 "rank_manifests": rank_manifests,
             }
             with open(manifest_path, "w", encoding="utf-8") as f:
@@ -3692,7 +3759,14 @@ class Worker:
                 ]
             )
             group.process = subprocess.Popen(cmd)
-            ready = self._wait_mpi_ready_files(group, deadline)
+            try:
+                if ready_sock is None:
+                    ready = self._wait_mpi_ready_files(group, deadline)
+                else:
+                    ready = self._wait_mpi_ready_tcp(group, ready_sock, ready_token, deadline)
+            finally:
+                if ready_sock is not None:
+                    ready_sock.close()
             for rank in group.ranks:
                 payload = ready[rank.rank]
                 if int(payload["command_port"]) != rank.command_port or int(payload["health_port"]) != rank.health_port:
@@ -3725,8 +3799,7 @@ class Worker:
             raise TypeError("remote memory APIs require a level >= 4 parent Worker")
         if int(worker_id) not in self._remote_like_worker_ids():
             raise ValueError(
-                "remote memory APIs require a remote worker id returned by add_remote_worker "
-                "or add_mpirun_worker_group"
+                "remote memory APIs require a remote worker id returned by add_remote_worker or add_mpirun_worker_group"
             )
         if self._worker is None:
             raise RuntimeError("remote memory APIs require a started hierarchical Worker")
@@ -3741,8 +3814,7 @@ class Worker:
         ``_require_remote_worker_started``."""
         if int(worker_id) not in self._remote_like_worker_ids():
             raise ValueError(
-                "remote memory APIs require a remote worker id returned by add_remote_worker "
-                "or add_mpirun_worker_group"
+                "remote memory APIs require a remote worker id returned by add_remote_worker or add_mpirun_worker_group"
             )
         if self._worker is None:
             raise RuntimeError("remote memory APIs require a started hierarchical Worker")

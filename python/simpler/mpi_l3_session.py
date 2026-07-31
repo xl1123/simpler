@@ -1,7 +1,10 @@
 # Copyright (c) PyPTO Contributors.
 # This program is free software, you can redistribute it and/or modify it under the terms and conditions of
 # CANN Open Software License Agreement Version 2.0 (the "License").
-# Please refer to LICENSE in the root of the software repository for the full text of the License.
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 """MPI-launched Remote L3 session runner.
 
@@ -16,6 +19,8 @@ import argparse
 import json
 import os
 import signal
+import socket
+import struct
 import sys
 from typing import Any
 
@@ -123,6 +128,12 @@ def _write_ready_file(ready_dir: str, rank: int, payload: dict[str, Any]) -> Non
     os.replace(tmp_path, final_path)
 
 
+def _send_ready_tcp(host: str, port: int, payload: dict[str, Any]) -> None:
+    data = json.dumps(payload, sort_keys=True).encode("utf-8")
+    with socket.create_connection((host, int(port)), timeout=10.0) as sock:
+        sock.sendall(struct.pack("<I", len(data)) + data)
+
+
 def _raise_keyboard_interrupt(_signum, _frame):
     raise KeyboardInterrupt
 
@@ -155,11 +166,18 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("MPI L3 group manifest worker_ids must match MPI_COMM_WORLD size")
 
     ready_dir = str(group_manifest["ready_dir"])
+    ready_host = str(group_manifest.get("ready_host") or "")
+    ready_port = int(group_manifest.get("ready_port") or 0)
+    ready_token = str(group_manifest.get("ready_token") or "")
 
     def ready_writer(payload: dict[str, Any]) -> None:
         payload = dict(payload)
         payload["mpi_rank"] = rank
-        _write_ready_file(ready_dir, rank, payload)
+        if ready_host:
+            payload["ready_token"] = ready_token
+            _send_ready_tcp(ready_host, ready_port, payload)
+        else:
+            _write_ready_file(ready_dir, rank, payload)
 
     exchange = MpiGlobalDomainExchange(comm, group_worker_ids=group_worker_ids)
     return run_session(

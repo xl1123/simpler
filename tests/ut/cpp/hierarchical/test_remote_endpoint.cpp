@@ -559,8 +559,8 @@ TEST(RemoteSocketTransport, RuntimeWriteToStalledReaderTimesOut) {
     server_thread.join();
 }
 
-TEST(RemoteSidecarTransport, HelloAndCompletionUseUnixCommandAndHealthLanes) {
-    std::string base = "/tmp/simpler-sidecar-" + std::to_string(::getpid());
+TEST(RemoteUnixTransport, HelloAndCompletionUseUnixCommandAndHealthLanes) {
+    std::string base = "/tmp/simpler-unix-" + std::to_string(::getpid());
     std::string command_path = base + "-command.sock";
     std::string health_path = base + "-health.sock";
     int command_listener = make_unix_listener(command_path);
@@ -595,7 +595,7 @@ TEST(RemoteSidecarTransport, HelloAndCompletionUseUnixCommandAndHealthLanes) {
         ::close(command_listener);
     });
 
-    RemoteL3SidecarTransport transport(command_path, health_path, 2.0, 2.0);
+    RemoteL3UnixTransport transport(command_path, health_path, 2.0, 2.0);
     EXPECT_NO_THROW(transport.expect_hello_ready(17, 4, "sim"));
     std::vector<uint8_t> request{0x1};
     EXPECT_NO_THROW(transport.submit_frame(request));
@@ -609,13 +609,12 @@ TEST(RemoteSidecarTransport, HelloAndCompletionUseUnixCommandAndHealthLanes) {
     (void)::unlink(health_path.c_str());
 }
 
-TEST(RemoteSidecarTransport, ConstructorValidatesPathsAndTimeoutsBeforeConnect) {
-    EXPECT_THROW(RemoteL3SidecarTransport("", "/tmp/health.sock", 1.0, 1.0), std::invalid_argument);
-    EXPECT_THROW(RemoteL3SidecarTransport("/tmp/command.sock", "", 1.0, 1.0), std::invalid_argument);
-    EXPECT_THROW(RemoteL3SidecarTransport("/tmp/command.sock", "/tmp/health.sock", 0.0, 1.0), std::invalid_argument);
-    EXPECT_THROW(RemoteL3SidecarTransport("/tmp/command.sock", "/tmp/health.sock", 1.0, 0.0), std::invalid_argument);
-    EXPECT_THROW(RemoteL3SidecarTransport(std::string(200, 'x'), "/tmp/health.sock", 1.0, 1.0),
-                 std::invalid_argument);
+TEST(RemoteUnixTransport, ConstructorValidatesPathsAndTimeoutsBeforeConnect) {
+    EXPECT_THROW(RemoteL3UnixTransport("", "/tmp/health.sock", 1.0, 1.0), std::invalid_argument);
+    EXPECT_THROW(RemoteL3UnixTransport("/tmp/command.sock", "", 1.0, 1.0), std::invalid_argument);
+    EXPECT_THROW(RemoteL3UnixTransport("/tmp/command.sock", "/tmp/health.sock", 0.0, 1.0), std::invalid_argument);
+    EXPECT_THROW(RemoteL3UnixTransport("/tmp/command.sock", "/tmp/health.sock", 1.0, 0.0), std::invalid_argument);
+    EXPECT_THROW(RemoteL3UnixTransport(std::string(200, 'x'), "/tmp/health.sock", 1.0, 1.0), std::invalid_argument);
 }
 
 TEST(RemoteEndpoint, BareHostPointerWithoutSidecarIsEndpointFailure) {

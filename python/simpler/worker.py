@@ -77,7 +77,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from multiprocessing.shared_memory import SharedMemory
-from typing import Any, Union, cast
+from typing import Any, Callable, Union, cast
 
 import cloudpickle
 from _task_interface import (  # pyright: ignore[reportMissingImports]
@@ -369,9 +369,8 @@ class RemoteCallable:
 
 @dataclass(frozen=True)
 class RemoteWorkerSpec:
-    # endpoint is "host:port"; host must be a numeric IP (or "localhost").
-    # Hostnames are rejected at add_remote_worker time — getaddrinfo resolution is
-    # unbounded and uncancellable and would risk pinning startup on a hung DNS.
+    # socket uses "host:port". mpi_l3 uses the logical endpoint
+    # "mpi://rank/N" and a local gateway_endpoint UDS.
     endpoint: str
     platform: str
     runtime: str = "tensormap_and_ringbuffer"
@@ -381,8 +380,8 @@ class RemoteWorkerSpec:
     session_listen_host: str | None = None
     allow_wildcard_session_bind: bool = False
     control_transport: str = "socket"
-    sidecar_endpoint: str | None = None
     mpi_rank: int | None = None
+    gateway_endpoint: str | None = None
 
     def __post_init__(self) -> None:
         if not self.endpoint:
@@ -403,8 +402,8 @@ class RemoteWorkerSpec:
         )
         object.__setattr__(
             self,
-            "sidecar_endpoint",
-            None if self.sidecar_endpoint is None else str(self.sidecar_endpoint),
+            "gateway_endpoint",
+            None if self.gateway_endpoint is None else str(self.gateway_endpoint),
         )
         object.__setattr__(self, "mpi_rank", None if self.mpi_rank is None else int(self.mpi_rank))
         object.__setattr__(self, "allow_wildcard_session_bind", bool(self.allow_wildcard_session_bind))
@@ -412,20 +411,26 @@ class RemoteWorkerSpec:
         object.__setattr__(self, "num_sub_workers", int(self.num_sub_workers))
         if self.num_sub_workers < 0:
             raise ValueError("RemoteWorkerSpec.num_sub_workers must be non-negative")
-        if self.control_transport not in ("socket", "mpi_sidecar"):
-            raise ValueError("RemoteWorkerSpec.control_transport must be 'socket' or 'mpi_sidecar'")
+        if self.control_transport not in ("socket", "mpi_l3"):
+            raise ValueError("RemoteWorkerSpec.control_transport must be 'socket' or 'mpi_l3'")
         if self.control_transport == "socket":
-            if self.sidecar_endpoint is not None or self.mpi_rank is not None:
-                raise ValueError("RemoteWorkerSpec socket control transport does not accept sidecar-only fields")
+            if self.gateway_endpoint is not None or self.mpi_rank is not None:
+                raise ValueError("RemoteWorkerSpec socket control transport does not accept MPI fields")
             return
-        if self.sidecar_endpoint is None:
-            raise ValueError("RemoteWorkerSpec.sidecar_endpoint is required for mpi_sidecar")
-        if not os.path.isabs(self.sidecar_endpoint):
-            raise ValueError("RemoteWorkerSpec.sidecar_endpoint must be an absolute Unix socket path")
-        if "\x00" in self.sidecar_endpoint or len(os.fsencode(self.sidecar_endpoint)) >= 104:
-            raise ValueError("RemoteWorkerSpec.sidecar_endpoint is not a valid portable Unix socket path")
+        if self.session_listen_host is not None or self.allow_wildcard_session_bind:
+            raise ValueError("RemoteWorkerSpec mpi_l3 does not accept TCP session listener fields")
+        local_endpoint = self.gateway_endpoint
         if self.mpi_rank is None or self.mpi_rank < 0:
-            raise ValueError("RemoteWorkerSpec.mpi_rank must be non-negative for mpi_sidecar")
+            raise ValueError("RemoteWorkerSpec.mpi_rank must be non-negative for mpi_l3")
+        expected_endpoint = f"mpi://rank/{self.mpi_rank}"
+        if self.endpoint != expected_endpoint:
+            raise ValueError(f"RemoteWorkerSpec.endpoint must be {expected_endpoint!r} for mpi_l3")
+        if local_endpoint is None:
+            raise ValueError("RemoteWorkerSpec.gateway_endpoint is required for mpi_l3")
+        if not os.path.isabs(local_endpoint):
+            raise ValueError("RemoteWorkerSpec.gateway_endpoint must be an absolute Unix socket path")
+        if "\x00" in local_endpoint or len(os.fsencode(local_endpoint)) >= 104:
+            raise ValueError("RemoteWorkerSpec.gateway_endpoint is not a valid portable Unix socket path")
 
 
 @dataclass(frozen=True)
@@ -440,7 +445,7 @@ class _RemoteSession:
 
 
 @dataclass(frozen=True)
-class _RemoteSidecarSession:
+class _RemoteUnixSession:
     worker_id: int
     session_id: int
     command_path: str
@@ -448,7 +453,7 @@ class _RemoteSidecarSession:
     pid: int
 
 
-_AnyRemoteSession = Union[_RemoteSession, _RemoteSidecarSession]
+_AnyRemoteSession = Union[_RemoteSession, _RemoteUnixSession]
 
 
 _IdentitySnapshotEntry = tuple[bytes, Any, int, str, str]
@@ -2199,8 +2204,9 @@ class Worker:
             # Validate the endpoint here, before any startup resource exists, so a
             # non-numeric host fails at registration rather than mid-activation
             # (which would roll back the whole already-forked tree).
-            host, _port = self._parse_remote_endpoint(spec.endpoint)
-            self._validate_numeric_endpoint_host(host)
+            if spec.control_transport != "mpi_l3":
+                host, _port = self._parse_remote_endpoint(spec.endpoint)
+                self._validate_numeric_endpoint_host(host)
             worker_id = self._allocate_next_level_worker_id()
             self._remote_worker_specs.append(spec)
             self._remote_worker_ids.append(worker_id)
@@ -2301,7 +2307,7 @@ class Worker:
     def _connect_unix_within_deadline(path: str, deadline: float) -> socket.socket:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            sock.settimeout(Worker._remaining_until(deadline, "remote L3 sidecar connect"))
+            sock.settimeout(Worker._remaining_until(deadline, "remote L3 Unix connect"))
             sock.connect(path)
             return sock
         except BaseException:
@@ -2358,11 +2364,17 @@ class Worker:
     def _build_remote_manifest(
         self, *, spec: RemoteWorkerSpec, worker_id: int, session_id: int, startup_remaining_s: float
     ) -> dict[str, Any]:
-        daemon_host, _daemon_port = self._parse_remote_endpoint(spec.endpoint)
-        listen_host = spec.session_listen_host or ("127.0.0.1" if daemon_host == "localhost" else daemon_host)
-        if self._is_wildcard_session_host(listen_host) and not spec.allow_wildcard_session_bind:
-            raise ValueError("RemoteWorkerSpec wildcard session bind requires allow_wildcard_session_bind=True")
-        return {
+        if spec.control_transport == "mpi_l3":
+            daemon_host = None
+            listen_host = None
+        else:
+            daemon_host, _daemon_port = self._parse_remote_endpoint(spec.endpoint)
+            listen_host = spec.session_listen_host or (
+                "127.0.0.1" if daemon_host == "localhost" else daemon_host
+            )
+            if self._is_wildcard_session_host(listen_host) and not spec.allow_wildcard_session_bind:
+                raise ValueError("RemoteWorkerSpec wildcard session bind requires allow_wildcard_session_bind=True")
+        manifest = {
             "session_id": int(session_id),
             "parent_worker_level": int(self.level),
             "remote_worker_level": 3,
@@ -2378,12 +2390,14 @@ class Worker:
             # distinct: the remote must not spend runtime-command time as startup time.
             "session_timeout_s": self._remote_session_timeout_s(),
             "startup_remaining_s": float(startup_remaining_s),
-            "listen_host": listen_host,
-            "connect_host": daemon_host,
             "remote_task_dispatcher": self._remote_dispatcher_entries_for_worker(worker_id),
             "inner_l3_worker": [],
             "feature_flags": [],
         }
+        if daemon_host is not None and listen_host is not None:
+            manifest["listen_host"] = listen_host
+            manifest["connect_host"] = daemon_host
+        return manifest
 
     def _open_remote_session(
         self, *, spec: RemoteWorkerSpec, worker_id: int, session_id: int, deadline: float
@@ -2416,38 +2430,35 @@ class Worker:
             pid=int(reply.get("pid", 0)),
         )
 
-    def _open_remote_sidecar_session(
+    def _open_remote_mpi_l3_session(
         self, *, spec: RemoteWorkerSpec, worker_id: int, session_id: int, deadline: float
-    ) -> _RemoteSidecarSession:
-        assert spec.sidecar_endpoint is not None
+    ) -> _RemoteUnixSession:
+        assert spec.gateway_endpoint is not None
         assert spec.mpi_rank is not None
-        daemon_host, daemon_port = self._parse_remote_endpoint(spec.endpoint)
-        with self._connect_unix_within_deadline(spec.sidecar_endpoint, deadline) as sock:
+        with self._connect_unix_within_deadline(spec.gateway_endpoint, deadline) as sock:
             manifest = self._build_remote_manifest(
                 spec=spec, worker_id=worker_id, session_id=session_id, startup_remaining_s=0.0
             )
             manifest["startup_remaining_s"] = self._remaining_until(
-                deadline, "remote L3 sidecar handshake"
+                deadline, "direct MPI L3 handshake"
             )
             request = {
                 "version": 1,
                 "op": "OPEN_SESSION",
                 "target_rank": spec.mpi_rank,
-                "daemon_host": daemon_host,
-                "daemon_port": daemon_port,
                 "manifest": manifest,
             }
-            sock.settimeout(self._remaining_until(deadline, "remote L3 sidecar handshake"))
+            sock.settimeout(self._remaining_until(deadline, "direct MPI L3 handshake"))
             self._send_remote_daemon_json(sock, request)
             reply = self._recv_remote_daemon_json(sock, deadline)
         if not reply.get("ok", False):
-            raise RuntimeError(f"remote L3 sidecar startup failed for worker {worker_id}: {reply.get('error')}")
+            raise RuntimeError(f"direct MPI L3 startup failed for worker {worker_id}: {reply.get('error')}")
         command_path = str(reply["command_path"])
         health_path = str(reply["health_path"])
         for name, path in (("command_path", command_path), ("health_path", health_path)):
             if not os.path.isabs(path) or "\x00" in path or len(os.fsencode(path)) >= 104:
-                raise RuntimeError(f"remote L3 sidecar returned invalid {name}")
-        return _RemoteSidecarSession(
+                raise RuntimeError(f"direct MPI L3 gateway returned invalid {name}")
+        return _RemoteUnixSession(
             worker_id=worker_id,
             session_id=session_id,
             command_path=command_path,
@@ -2461,7 +2472,7 @@ class Worker:
         from .remote_l3_protocol import FrameHeader, FrameType, send_frame  # noqa: PLC0415
 
         try:
-            if isinstance(session, _RemoteSidecarSession):
+            if isinstance(session, _RemoteUnixSession):
                 sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 sock.settimeout(timeout_s)
                 sock.connect(session.command_path)
@@ -3930,7 +3941,13 @@ class Worker:
                     f"has no eligible dispatch target (needs {need})"
                 )
 
-    def init(self, prewarm_config=None, *, _startup_deadline: float | None = None) -> None:
+    def init(
+        self,
+        prewarm_config=None,
+        *,
+        _startup_deadline: float | None = None,
+        _post_fork_pre_threads: Callable[[], None] | None = None,
+    ) -> None:
         """Initialize the worker and bring its whole subtree to READY.
 
         For an L3+ worker ``init`` is the single startup submission point: it
@@ -3957,6 +3974,9 @@ class Worker:
                 inherited from a parent's startup epoch so a recursive descendant
                 consumes the parent's remaining budget instead of restarting the
                 timeout. ``None`` starts a fresh epoch.
+            _post_fork_pre_threads: Internal. Called after all local children are
+                READY and endpoints are registered, immediately before the C++
+                scheduler starts. Direct MPI L3 ranks initialize MPI at this seam.
         """
         if prewarm_config is not None:
             prewarm_config.validate()
@@ -4003,7 +4023,10 @@ class Worker:
                 self._init_level2()
             elif self.level >= 3:
                 self._init_hierarchical()
-                self._start_hierarchical()
+                if _post_fork_pre_threads is None:
+                    self._start_hierarchical()
+                else:
+                    self._start_hierarchical(_post_fork_pre_threads=_post_fork_pre_threads)
             else:
                 raise ValueError(f"Worker: level {self.level} not supported")
             # Atomic READY commit inside the exception boundary: publish the
@@ -4157,8 +4180,8 @@ class Worker:
                 session_id = 1
             # The handshake blocks until the remote subtree is READY; the whole
             # open derives its per-op remaining from the shared root deadline.
-            if spec.control_transport == "mpi_sidecar":
-                session = self._open_remote_sidecar_session(
+            if spec.control_transport == "mpi_l3":
+                session = self._open_remote_mpi_l3_session(
                     spec=spec,
                     worker_id=worker_id,
                     session_id=session_id,
@@ -4179,8 +4202,8 @@ class Worker:
             # attach_timeout bounds the command/health connect + HELLO read by the
             # remaining startup budget; runtime_timeout is the full runtime command
             # budget, never clamped by leftover startup time.
-            if isinstance(session, _RemoteSidecarSession):
-                self._worker.add_remote_l3_sidecar(
+            if isinstance(session, _RemoteUnixSession):
+                self._worker.add_remote_l3_unix(
                     session.worker_id,
                     session.session_id,
                     spec.transport,
@@ -4206,7 +4229,9 @@ class Worker:
         if time.monotonic() >= deadline:
             raise RuntimeError("remote L3 activation: startup deadline exceeded after attach")
 
-    def _start_hierarchical(self) -> None:  # noqa: PLR0912 -- three parallel fork loops (sub/chip/next) + bootstrap wait + scheduler register/init; branches track the fork order documented in the body
+    def _start_hierarchical(  # noqa: PLR0912 -- three parallel fork loops (sub/chip/next) + bootstrap wait + scheduler register/init; branches track the fork order documented in the body
+        self, *, _post_fork_pre_threads: Callable[[], None] | None = None
+    ) -> None:
         """Fork every local child, await the subtree, register endpoints, start the scheduler.
 
         Called only by init(), which owns the lifecycle state. Any failure here
@@ -4401,6 +4426,9 @@ class Worker:
 
         for shm in self._sub_shms:
             dw.add_sub_worker(_mailbox_addr(shm))
+
+        if _post_fork_pre_threads is not None:
+            _post_fork_pre_threads()
 
         # Start Scheduler + WorkerThreads (C++ threads start here, after fork)
         dw.init()

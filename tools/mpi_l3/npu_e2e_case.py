@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Run the same real L4 -> remote L3 -> two-L2-NPU task over socket or MPI."""
+"""Run the real L4 -> MPI L3 -> two-L2-NPU validation task."""
 
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ from simpler_setup.elf_parser import extract_text_section
 from simpler_setup.kernel_compiler import KernelCompiler
 from simpler_setup.pto_isa import ensure_pto_isa_root
 
-REMOTE_ORCH_TARGET = "tools.mpi_l4_sidecar.npu_e2e_case:remote_l3_group_orch"
+REMOTE_ORCH_TARGET = "tools.mpi_l3.npu_e2e_case:remote_l3_group_orch"
 ELEMENTS = 128 * 128
 FLOAT_NBYTES = ctypes.sizeof(ctypes.c_float)
 TENSOR_COUNT = 6
@@ -178,10 +178,10 @@ def _remote_spec(
     ns: argparse.Namespace, endpoint: str, devices: tuple[int, ...], mpi_rank: int
 ) -> RemoteWorkerSpec:
     transport_args: dict[str, object] = {}
-    if ns.control_transport == "mpi_sidecar":
+    if ns.control_transport == "mpi_l3":
         transport_args = {
-            "control_transport": "mpi_sidecar",
-            "sidecar_endpoint": ns.sidecar_endpoint,
+            "control_transport": "mpi_l3",
+            "gateway_endpoint": ns.gateway_endpoint,
             "mpi_rank": mpi_rank,
         }
     return RemoteWorkerSpec(
@@ -190,8 +190,8 @@ def _remote_spec(
         runtime=ns.runtime,
         device_ids=devices,
         transport="sim",
-        session_listen_host=ns.session_listen_host,
-        allow_wildcard_session_bind=True,
+        session_listen_host=ns.session_listen_host if ns.control_transport != "mpi_l3" else None,
+        allow_wildcard_session_bind=ns.control_transport != "mpi_l3",
         **transport_args,
     )
 
@@ -306,14 +306,14 @@ def run_case(ns: argparse.Namespace) -> dict[str, object]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--control-transport", choices=("socket", "mpi_sidecar"), required=True)
+    parser.add_argument("--control-transport", choices=("socket", "mpi_l3"), required=True)
     parser.add_argument("--machine-a", required=True)
     parser.add_argument("--machine-b", required=True)
     parser.add_argument("--machine-a-devices", default="0,1")
     parser.add_argument("--machine-b-devices", default="0,1")
     parser.add_argument("--machine-a-mpi-rank", type=int, default=0)
     parser.add_argument("--machine-b-mpi-rank", type=int, default=1)
-    parser.add_argument("--sidecar-endpoint")
+    parser.add_argument("--gateway-endpoint")
     parser.add_argument("--platform", default="a2a3")
     parser.add_argument("--runtime", default="tensormap_and_ringbuffer")
     parser.add_argument("--block-dim", type=int, default=1)
@@ -322,8 +322,8 @@ def main(argv: list[str] | None = None) -> int:
     ns = parser.parse_args(argv)
     if ns.block_dim <= 0:
         parser.error("--block-dim must be positive")
-    if ns.control_transport == "mpi_sidecar" and not ns.sidecar_endpoint:
-        parser.error("--sidecar-endpoint is required for mpi_sidecar")
+    if ns.control_transport == "mpi_l3" and not ns.gateway_endpoint:
+        parser.error("--gateway-endpoint is required for mpi_l3")
     print(json.dumps(run_case(ns), sort_keys=True), flush=True)
     return 0
 

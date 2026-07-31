@@ -6,48 +6,43 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Local proxy between a Simpler L4/L3 process and the MPI sidecar.
-
-The proxy owns JSON bootstrap and socket lifecycle. The C++ sidecar only moves
-opaque envelopes with MPI, so no MPI library is loaded into a Worker process.
-"""
+"""Rank-0 UDS gateway and opaque MPI envelope routing for direct MPI L3."""
 
 from __future__ import annotations
 
-import argparse
 import contextlib
 import enum
 import hashlib
 import json
 import os
-import signal
+import queue
 import socket
 import struct
-import sys
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
-SIDECAR_MAGIC = b"SLM1"
-SIDECAR_VERSION = 2
-SIDECAR_HEADER = struct.Struct("<4sIIiiQIIQ")
-SIDECAR_MAX_PAYLOAD = 16 * 1024 * 1024
+from .remote_l3_protocol import FrameHeader, FrameType, encode_frame
+from .remote_l3_session import _run_command_loop
+from .worker import Worker
+
+MPI_L3_MAGIC = b"ML3P"
+MPI_L3_VERSION = 1
+MPI_L3_HEADER = struct.Struct("<4sIIiiQIIQ")
+MPI_L3_MAX_PAYLOAD = 16 * 1024 * 1024
 SLR3_HEADER_BYTES = 40
 SLR3_MAX_PAYLOAD = 16 * 1024 * 1024
 
 
 class MessageType(enum.IntEnum):
-    WORLD_READY = 1
-    OPEN_SESSION = 2
-    OPEN_SESSION_REPLY = 3
-    FRAME = 4
-    CLOSE_SESSION = 5
-    ERROR = 6
-    SHUTDOWN = 7
-    FRAME_L4_TO_L3 = 8
-    FRAME_L3_TO_L4 = 9
+    OPEN_SESSION = 1
+    OPEN_SESSION_REPLY = 2
+    CLOSE_SESSION = 3
+    SHUTDOWN = 4
+    FRAME_L4_TO_L3 = 5
+    FRAME_L3_TO_L4 = 6
 
 
 class Lane(enum.IntEnum):
@@ -67,13 +62,19 @@ class Envelope:
     payload: bytes = b""
 
 
+class MpiTransport(Protocol):
+    def send(self, target_rank: int, payload: bytes) -> None: ...
+
+    def receive(self) -> tuple[int, bytes] | None: ...
+
+
 def encode_envelope(envelope: Envelope) -> bytes:
     payload = bytes(envelope.payload)
-    if len(payload) > SIDECAR_MAX_PAYLOAD:
-        raise ValueError("sidecar payload exceeds maximum")
-    return SIDECAR_HEADER.pack(
-        SIDECAR_MAGIC,
-        SIDECAR_VERSION,
+    if len(payload) > MPI_L3_MAX_PAYLOAD:
+        raise ValueError("MPI L3 payload exceeds maximum")
+    return MPI_L3_HEADER.pack(
+        MPI_L3_MAGIC,
+        MPI_L3_VERSION,
         int(envelope.message_type),
         int(envelope.source_rank),
         int(envelope.target_rank),
@@ -82,6 +83,24 @@ def encode_envelope(envelope: Envelope) -> bytes:
         len(payload),
         int(envelope.sequence),
     ) + payload
+
+
+def decode_envelope(data: bytes) -> Envelope:
+    if len(data) < MPI_L3_HEADER.size:
+        raise ValueError("MPI L3 envelope is truncated")
+    magic, version, raw_type, source, target, session_id, raw_lane, payload_size, sequence = (
+        MPI_L3_HEADER.unpack_from(data)
+    )
+    if magic != MPI_L3_MAGIC or version != MPI_L3_VERSION:
+        raise ValueError("MPI L3 envelope magic or version mismatch")
+    if payload_size > MPI_L3_MAX_PAYLOAD or len(data) != MPI_L3_HEADER.size + payload_size:
+        raise ValueError("MPI L3 envelope payload length is invalid")
+    try:
+        message_type = MessageType(raw_type)
+        lane = Lane(raw_lane)
+    except ValueError as exc:
+        raise ValueError("MPI L3 envelope type or lane is unknown") from exc
+    return Envelope(message_type, source, target, session_id, lane, sequence, data[MPI_L3_HEADER.size :])
 
 
 def _read_exact(sock: socket.socket, size: int) -> bytes:
@@ -94,33 +113,16 @@ def _read_exact(sock: socket.socket, size: int) -> bytes:
     return bytes(data)
 
 
-def read_envelope(sock: socket.socket) -> Envelope:
-    header = _read_exact(sock, SIDECAR_HEADER.size)
-    magic, version, raw_type, source, target, session_id, raw_lane, payload_size, sequence = (
-        SIDECAR_HEADER.unpack(header)
-    )
-    if magic != SIDECAR_MAGIC or version != SIDECAR_VERSION:
-        raise ValueError("sidecar envelope magic or version mismatch")
-    if payload_size > SIDECAR_MAX_PAYLOAD:
-        raise ValueError("sidecar payload exceeds maximum")
-    try:
-        message_type = MessageType(raw_type)
-        lane = Lane(raw_lane)
-    except ValueError as exc:
-        raise ValueError("sidecar envelope type or lane is unknown") from exc
-    return Envelope(message_type, source, target, session_id, lane, sequence, _read_exact(sock, payload_size))
-
-
 def _send_json(sock: socket.socket, payload: dict[str, Any]) -> None:
     data = json.dumps(payload, sort_keys=True).encode("utf-8")
-    if len(data) > SIDECAR_MAX_PAYLOAD:
+    if len(data) > MPI_L3_MAX_PAYLOAD:
         raise ValueError("JSON payload exceeds maximum")
     sock.sendall(struct.pack("<I", len(data)) + data)
 
 
 def _read_json(sock: socket.socket) -> dict[str, Any]:
     size = struct.unpack("<I", _read_exact(sock, 4))[0]
-    if size > SIDECAR_MAX_PAYLOAD:
+    if size > MPI_L3_MAX_PAYLOAD:
         raise ValueError("JSON payload exceeds maximum")
     value = json.loads(_read_exact(sock, size).decode("utf-8"))
     if not isinstance(value, dict):
@@ -139,32 +141,6 @@ def _slr3_identity(frame: bytes) -> tuple[int, int, int]:
     if len(frame) != SLR3_HEADER_BYTES + payload_size:
         raise ValueError("SLR3 frame payload length mismatch")
     return int(session_id), int(worker_id), int(sequence)
-
-
-def _log_frame(event: str, envelope: Envelope) -> None:
-    _session_id, worker_id, sequence = _slr3_identity(envelope.payload)
-    frame_type = struct.unpack_from("<I", envelope.payload, 8)[0]
-    print(
-        json.dumps(
-            {
-                "event": event,
-                "rank": envelope.source_rank,
-                "target_rank": envelope.target_rank,
-                "session_id": envelope.session_id,
-                "worker_id": worker_id,
-                "lane": envelope.lane.name,
-                "frame_type": frame_type,
-                "sequence": sequence,
-                "sha256": hashlib.sha256(envelope.payload).hexdigest(),
-            },
-            sort_keys=True,
-        ),
-        flush=True,
-    )
-
-
-def _log_event(event: str, **fields: Any) -> None:
-    print(json.dumps({"event": event, **fields}, sort_keys=True), flush=True)
 
 
 def _read_slr3(sock: socket.socket) -> bytes:
@@ -190,22 +166,24 @@ def _bind_unix(path: str) -> socket.socket:
     return listener
 
 
-def _worker_ids_for_rank(worker_map: str, rank: int) -> set[int]:
-    result: dict[int, set[int]] = {}
-    for entry in worker_map.split(";"):
-        rank_text, separator, workers_text = entry.partition(":")
-        if not separator or not rank_text:
-            raise ValueError("worker map must use rank:worker,worker entries")
-        parsed_rank = int(rank_text)
-        if parsed_rank < 0 or parsed_rank in result:
-            raise ValueError("worker map contains a duplicate rank")
-        workers = [int(item) for item in workers_text.split(",") if item]
-        if any(worker < 0 for worker in workers) or len(workers) != len(set(workers)):
-            raise ValueError("worker map contains an invalid or duplicate worker id")
-        result[parsed_rank] = set(workers)
-    if rank not in result:
-        raise ValueError(f"worker map has no entry for rank {rank}")
-    return result[rank]
+def _log_event(event: str, **fields: Any) -> None:
+    print(json.dumps({"event": event, **fields}, sort_keys=True), flush=True)
+
+
+def _log_frame(event: str, envelope: Envelope) -> None:
+    _session_id, worker_id, sequence = _slr3_identity(envelope.payload)
+    frame_type = struct.unpack_from("<I", envelope.payload, 8)[0]
+    _log_event(
+        event,
+        rank=envelope.source_rank,
+        target_rank=envelope.target_rank,
+        session_id=envelope.session_id,
+        worker_id=worker_id,
+        lane=envelope.lane.name,
+        frame_type=frame_type,
+        sequence=sequence,
+        sha256=hashlib.sha256(envelope.payload).hexdigest(),
+    )
 
 
 @dataclass
@@ -244,7 +222,6 @@ class _TargetSession:
     session_id: int
     worker_id: int
     source_rank: int
-    pid: int
     runtime_timeout_s: float
     sockets: dict[Lane, socket.socket]
     locks: dict[Lane, threading.Lock] = field(
@@ -260,23 +237,23 @@ class _TargetSession:
                     sock.close()
 
 
-class SidecarProxy:
+class MpiL3Gateway:  # noqa: PLR0904 -- owns bootstrap, source, target, routing, and lifecycle boundaries
     def __init__(
         self,
         *,
         rank: int,
-        sidecar_socket: str,
-        session_dir: str,
-        worker_ids: set[int],
+        world_size: int,
         bootstrap_socket: str | None,
+        session_dir: str,
+        inner_worker: Worker,
+        rank_config: dict[str, Any],
     ) -> None:
         self.rank = rank
-        self.sidecar_socket = sidecar_socket
-        self.session_dir = session_dir
-        self.worker_ids = worker_ids
+        self.world_size = world_size
         self.bootstrap_socket = bootstrap_socket
-        self._sidecar: socket.socket | None = None
-        self._sidecar_send_lock = threading.Lock()
+        self.session_dir = session_dir
+        self.inner_worker = inner_worker
+        self.rank_config = rank_config
         self._state_lock = threading.Lock()
         self._stop = threading.Event()
         self._pending: dict[int, _PendingOpen] = {}
@@ -285,14 +262,8 @@ class SidecarProxy:
         self._targets: dict[int, _TargetSession] = {}
         self._closed_sessions: set[int] = set()
         self._listeners: list[socket.socket] = []
-
-    def _send(self, envelope: Envelope) -> None:
-        sidecar = self._sidecar
-        if sidecar is None:
-            raise RuntimeError("MPI sidecar is not connected")
-        data = encode_envelope(envelope)
-        with self._sidecar_send_lock:
-            sidecar.sendall(data)
+        self._outbound: queue.Queue[Envelope] = queue.Queue()
+        self._direct_resources: dict[int, tuple[threading.Event, list[socket.socket], list[threading.Thread]]] = {}
 
     def _send_message(
         self,
@@ -304,7 +275,7 @@ class SidecarProxy:
         sequence: int = 0,
         payload: bytes = b"",
     ) -> None:
-        self._send(Envelope(message_type, -1, target_rank, session_id, lane, sequence, payload))
+        self._outbound.put(Envelope(message_type, -1, target_rank, session_id, lane, sequence, payload))
 
     def _session_paths(self, session_id: int) -> tuple[str, str]:
         root = Path(self.session_dir) / f"s{session_id:x}"
@@ -323,7 +294,16 @@ class SidecarProxy:
                 frame = _read_slr3(conn)
                 frame_session, worker_id, sequence = _slr3_identity(frame)
                 if frame_session != session.session_id or worker_id != session.worker_id:
-                    raise ValueError("local L4 SLR3 identity differs from sidecar session")
+                    raise ValueError("local L4 SLR3 identity differs from MPI L3 session")
+                envelope = Envelope(
+                    MessageType.FRAME_L4_TO_L3,
+                    self.rank,
+                    session.target_rank,
+                    session.session_id,
+                    lane,
+                    sequence,
+                    frame,
+                )
                 self._send_message(
                     MessageType.FRAME_L4_TO_L3,
                     target_rank=session.target_rank,
@@ -332,18 +312,7 @@ class SidecarProxy:
                     sequence=sequence,
                     payload=frame,
                 )
-                _log_frame(
-                    "L4_TO_MPI",
-                    Envelope(
-                        MessageType.FRAME_L4_TO_L3,
-                        self.rank,
-                        session.target_rank,
-                        session.session_id,
-                        lane,
-                        sequence,
-                        frame,
-                    ),
-                )
+                _log_frame("L4_TO_MPI", envelope)
         except (EOFError, OSError, ValueError):
             pass
         finally:
@@ -358,7 +327,7 @@ class SidecarProxy:
 
     def _create_source_session(self, session_id: int, worker_id: int, target_rank: int) -> _SourceSession:
         if self._stop.is_set():
-            raise RuntimeError("MPI sidecar is stopping")
+            raise RuntimeError("MPI L3 gateway is stopping")
         with self._state_lock:
             if session_id in self._sources or session_id in self._opening_source_sessions:
                 raise RuntimeError("duplicate source session id")
@@ -385,17 +354,21 @@ class SidecarProxy:
             with self._state_lock:
                 if self._stop.is_set():
                     session.close()
-                    raise RuntimeError("MPI sidecar stopped during source session creation")
+                    raise RuntimeError("MPI L3 gateway stopped during source session creation")
                 self._closed_sessions.discard(session_id)
                 self._sources[session_id] = session
         finally:
             with self._state_lock:
                 self._opening_source_sessions.discard(session_id)
         threading.Thread(
-            target=self._accept_source_lane, args=(session, Lane.COMMAND, command_listener), daemon=True
+            target=self._accept_source_lane,
+            args=(session, Lane.COMMAND, command_listener),
+            daemon=True,
         ).start()
         threading.Thread(
-            target=self._accept_source_lane, args=(session, Lane.HEALTH, health_listener), daemon=True
+            target=self._accept_source_lane,
+            args=(session, Lane.HEALTH, health_listener),
+            daemon=True,
         ).start()
         return session
 
@@ -409,8 +382,10 @@ class SidecarProxy:
                 _send_json(conn, {"ok": True})
                 return
             if request.get("version") != 1 or request.get("op") != "OPEN_SESSION":
-                raise ValueError("unsupported sidecar bootstrap request")
+                raise ValueError("unsupported MPI L3 gateway bootstrap request")
             target_rank = int(request["target_rank"])
+            if target_rank < 0 or target_rank >= self.world_size:
+                raise ValueError("OPEN_SESSION target_rank is outside the MPI world")
             manifest = request.get("manifest")
             if not isinstance(manifest, dict):
                 raise ValueError("OPEN_SESSION manifest must be an object")
@@ -421,7 +396,7 @@ class SidecarProxy:
             if remaining <= 0:
                 raise TimeoutError("OPEN_SESSION startup budget is exhausted")
             _log_event(
-                "L4_OPEN_SESSION_MPI",
+                "L4_OPEN_SESSION_MPI_L3",
                 rank=self.rank,
                 target_rank=target_rank,
                 session_id=session_id,
@@ -439,12 +414,11 @@ class SidecarProxy:
             forwarded_manifest = dict(manifest)
             forwarded_manifest["startup_remaining_s"] = max(0.0, remaining - (time.monotonic() - started))
             forwarded["manifest"] = forwarded_manifest
-            payload = json.dumps(forwarded, sort_keys=True).encode("utf-8")
             self._send_message(
                 MessageType.OPEN_SESSION,
                 target_rank=target_rank,
                 session_id=session_id,
-                payload=payload,
+                payload=json.dumps(forwarded, sort_keys=True).encode("utf-8"),
             )
             if not pending.event.wait(timeout=remaining):
                 raise TimeoutError("MPI OPEN_SESSION reply timed out")
@@ -470,11 +444,6 @@ class SidecarProxy:
         with conn:
             self._handle_bootstrap(conn)
 
-    def _connect_runner(self, host: str, port: int, timeout: float) -> socket.socket:
-        sock = socket.create_connection((host, port), timeout=timeout)
-        sock.settimeout(None)
-        return sock
-
     def _forward_target_lane(self, session: _TargetSession, lane: Lane) -> None:
         try:
             sock = session.sockets[lane]
@@ -482,7 +451,16 @@ class SidecarProxy:
                 frame = _read_slr3(sock)
                 frame_session, worker_id, sequence = _slr3_identity(frame)
                 if frame_session != session.session_id or worker_id != session.worker_id:
-                    raise ValueError("remote L3 SLR3 identity differs from sidecar session")
+                    raise ValueError("local L3 SLR3 identity differs from MPI L3 session")
+                envelope = Envelope(
+                    MessageType.FRAME_L3_TO_L4,
+                    self.rank,
+                    session.source_rank,
+                    session.session_id,
+                    lane,
+                    sequence,
+                    frame,
+                )
                 self._send_message(
                     MessageType.FRAME_L3_TO_L4,
                     target_rank=session.source_rank,
@@ -491,18 +469,7 @@ class SidecarProxy:
                     sequence=sequence,
                     payload=frame,
                 )
-                _log_frame(
-                    "L3_TO_MPI",
-                    Envelope(
-                        MessageType.FRAME_L3_TO_L4,
-                        self.rank,
-                        session.source_rank,
-                        session.session_id,
-                        lane,
-                        sequence,
-                        frame,
-                    ),
-                )
+                _log_frame("L3_TO_MPI", envelope)
         except (EOFError, OSError, ValueError) as exc:
             payload = json.dumps({"error": f"{type(exc).__name__}: {exc}"}, sort_keys=True).encode("utf-8")
             with contextlib.suppress(OSError, RuntimeError):
@@ -516,97 +483,140 @@ class SidecarProxy:
             if lane == Lane.COMMAND:
                 self._close_session(session.session_id)
 
-    def _open_target(self, envelope: Envelope) -> None:
+    @staticmethod
+    def _health_producer(
+        sock: socket.socket, stop: threading.Event, session_id: int, worker_id: int
+    ) -> None:
+        sequence = 0
+        try:
+            while not stop.wait(0.2):
+                sequence += 1
+                sock.sendall(encode_frame(FrameHeader(FrameType.HEALTH, session_id, worker_id, sequence)))
+        except OSError:
+            pass
+        finally:
+            with contextlib.suppress(OSError):
+                sock.close()
+
+    def _command_executor(
+        self, sock: socket.socket, manifest: dict[str, Any], stop: threading.Event
+    ) -> None:
+        try:
+            _run_command_loop(sock, manifest, self.inner_worker)
+        finally:
+            stop.set()
+            with contextlib.suppress(OSError):
+                sock.close()
+
+    def _validate_manifest(self, manifest: dict[str, Any], envelope: Envelope) -> int:
+        worker_id = int(manifest["worker_id"])
+        expected_worker_id = int(self.rank_config.get("worker_id", self.rank))
+        if worker_id != expected_worker_id:
+            raise ValueError(f"worker_id {worker_id} is not assigned to MPI rank {self.rank}")
+        if int(manifest["session_id"]) != envelope.session_id:
+            raise ValueError("OPEN_SESSION envelope and manifest session differ")
+        expected = {
+            "platform": str(self.rank_config["platform"]),
+            "runtime": str(self.rank_config["runtime"]),
+            "device_ids": [int(item) for item in self.rank_config["device_ids"]],
+            "num_sub_workers": int(self.rank_config.get("num_sub_workers", 0)),
+        }
+        for key, value in expected.items():
+            if manifest.get(key) != value:
+                raise ValueError(f"OPEN_SESSION {key} differs from the pre-launched MPI L3 rank")
+        if float(manifest["startup_remaining_s"]) <= 0:
+            raise TimeoutError("target startup budget is exhausted")
+        return worker_id
+
+    def _open_target(self, envelope: Envelope) -> None:  # noqa: PLR0915 -- atomic direct-session construction
         session: _TargetSession | None = None
-        session_registered = False
+        registered = False
+        resources: tuple[threading.Event, list[socket.socket], list[threading.Thread]] | None = None
         try:
             request = json.loads(envelope.payload.decode("utf-8"))
+            if request.get("version") != 1 or request.get("op") != "OPEN_SESSION":
+                raise ValueError("unsupported direct MPI L3 OPEN_SESSION request")
+            if int(request["target_rank"]) != self.rank:
+                raise ValueError("OPEN_SESSION request target differs from MPI envelope")
             manifest = request["manifest"]
             if not isinstance(manifest, dict):
                 raise ValueError("OPEN_SESSION manifest must be an object")
-            worker_id = int(manifest["worker_id"])
-            if worker_id not in self.worker_ids:
-                raise ValueError(f"worker_id {worker_id} is not assigned to MPI rank {self.rank}")
-            if int(manifest["session_id"]) != envelope.session_id:
-                raise ValueError("OPEN_SESSION envelope and manifest session differ")
-            timeout = float(manifest["startup_remaining_s"])
-            if timeout <= 0:
-                raise TimeoutError("target startup budget is exhausted")
-            daemon_host = str(request["daemon_host"])
-            daemon_port = int(request["daemon_port"])
-            _log_event(
-                "MPI_TARGET_CONNECT_REMOTE_L3",
-                rank=self.rank,
-                source_rank=envelope.source_rank,
-                session_id=envelope.session_id,
-                worker_id=worker_id,
-                daemon_endpoint=f"{daemon_host}:{daemon_port}",
-                daemon_transport="tcp",
-            )
-            started = time.monotonic()
-            daemon = socket.create_connection((daemon_host, daemon_port), timeout=timeout)
-            with daemon:
-                forwarded = dict(manifest)
-                forwarded["startup_remaining_s"] = max(0.0, timeout - (time.monotonic() - started))
-                _send_json(daemon, forwarded)
-                reply = _read_json(daemon)
-            if not reply.get("ok", False):
-                raise RuntimeError(f"remote daemon rejected session: {reply.get('error')}")
-            remaining = timeout - (time.monotonic() - started)
-            if remaining <= 0:
-                raise TimeoutError("target startup budget exhausted before runner attach")
-            command = self._connect_runner(str(reply["command_host"]), int(reply["command_port"]), remaining)
-            try:
-                health = self._connect_runner(str(reply["health_host"]), int(reply["health_port"]), remaining)
-            except BaseException:
-                command.close()
-                raise
+            worker_id = self._validate_manifest(manifest, envelope)
+            with self._state_lock:
+                if self._targets:
+                    raise RuntimeError("direct MPI L3 rank supports one active L4 session")
+            command_router, command_worker = socket.socketpair()
+            health_router, health_worker = socket.socketpair()
+            stop = threading.Event()
+            threads: list[threading.Thread] = []
+            resources = (stop, [command_worker, health_worker], threads)
             session = _TargetSession(
                 envelope.session_id,
                 worker_id,
                 envelope.source_rank,
-                int(reply.get("pid", 0)),
                 float(manifest["session_timeout_s"]),
-                {Lane.COMMAND: command, Lane.HEALTH: health},
+                {Lane.COMMAND: command_router, Lane.HEALTH: health_router},
             )
             with self._state_lock:
-                if self._stop.is_set():
-                    session.close()
-                    session = None
-                    raise RuntimeError("MPI sidecar stopped during target session creation")
-                if envelope.session_id in self._targets:
-                    session.close()
-                    session = None
-                    raise RuntimeError("duplicate target session id")
+                if self._stop.is_set() or envelope.session_id in self._targets:
+                    raise RuntimeError("direct MPI L3 stopped or received a duplicate session")
                 self._closed_sessions.discard(envelope.session_id)
                 self._targets[envelope.session_id] = session
-                session_registered = True
-            assert session is not None
-            _log_event(
-                "REMOTE_L3_SESSION_READY",
-                rank=self.rank,
-                source_rank=envelope.source_rank,
-                session_id=envelope.session_id,
-                worker_id=worker_id,
-                pid=session.pid,
-                command_endpoint=f"{reply['command_host']}:{reply['command_port']}",
-                health_endpoint=f"{reply['health_host']}:{reply['health_port']}",
-                runner_transport="tcp",
+                registered = True
+            threads.extend(
+                [
+                    threading.Thread(
+                        target=self._forward_target_lane,
+                        args=(session, Lane.COMMAND),
+                        daemon=True,
+                    ),
+                    threading.Thread(
+                        target=self._forward_target_lane,
+                        args=(session, Lane.HEALTH),
+                        daemon=True,
+                    ),
+                    threading.Thread(
+                        target=self._health_producer,
+                        args=(health_worker, stop, envelope.session_id, worker_id),
+                        daemon=True,
+                    ),
+                    threading.Thread(
+                        target=self._command_executor,
+                        args=(command_worker, manifest, stop),
+                        daemon=True,
+                    ),
+                ]
             )
-            result = {"ok": True, "worker_id": worker_id, "pid": session.pid}
+            self._direct_resources[envelope.session_id] = resources
+            result = {"ok": True, "worker_id": worker_id, "pid": os.getpid()}
             self._send_message(
                 MessageType.OPEN_SESSION_REPLY,
                 target_rank=envelope.source_rank,
                 session_id=envelope.session_id,
                 payload=json.dumps(result, sort_keys=True).encode("utf-8"),
             )
-            for lane in (Lane.COMMAND, Lane.HEALTH):
-                threading.Thread(target=self._forward_target_lane, args=(session, lane), daemon=True).start()
+            _log_event(
+                "MPI_L3_SESSION_READY",
+                rank=self.rank,
+                source_rank=envelope.source_rank,
+                session_id=envelope.session_id,
+                worker_id=worker_id,
+                l3_pid=os.getpid(),
+                l4_to_l3="uds+mpi",
+                l3_to_l2="mailbox",
+            )
+            for thread in threads:
+                thread.start()
         except Exception as exc:  # noqa: BLE001
-            if session_registered:
+            if registered:
                 self._close_session(envelope.session_id)
             elif session is not None:
                 session.close()
+            if resources is not None:
+                resources[0].set()
+                for sock in resources[1]:
+                    with contextlib.suppress(OSError):
+                        sock.close()
             result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
             with contextlib.suppress(OSError, RuntimeError):
                 self._send_message(
@@ -632,7 +642,7 @@ class SidecarProxy:
                 worker_id = int(reply["worker_id"])
                 session = self._create_source_session(envelope.session_id, worker_id, envelope.source_rank)
                 _log_event(
-                    "L4_SESSION_UDS_READY",
+                    "L4_MPI_L3_UDS_READY",
                     rank=self.rank,
                     target_rank=envelope.source_rank,
                     session_id=envelope.session_id,
@@ -660,21 +670,14 @@ class SidecarProxy:
     def _deliver_frame(self, envelope: Envelope) -> None:
         frame_session, worker_id, sequence = _slr3_identity(envelope.payload)
         if frame_session != envelope.session_id or sequence != envelope.sequence:
-            raise ValueError("sidecar envelope and SLR3 frame identity differ")
+            raise ValueError("MPI envelope and SLR3 frame identity differ")
         with self._state_lock:
             source = self._sources.get(envelope.session_id)
             target = self._targets.get(envelope.session_id)
             closed = envelope.session_id in self._closed_sessions
         source_matches = source is not None and envelope.source_rank == source.target_rank
         target_matches = target is not None and envelope.source_rank == target.source_rank
-        deliver_to_source = envelope.message_type == MessageType.FRAME_L3_TO_L4
-        deliver_to_target = envelope.message_type == MessageType.FRAME_L4_TO_L3
-        if envelope.message_type == MessageType.FRAME:
-            if source_matches == target_matches:
-                raise ValueError("legacy FRAME direction is ambiguous for this session")
-            deliver_to_source = source_matches
-            deliver_to_target = target_matches
-        if deliver_to_source and source_matches:
+        if envelope.message_type == MessageType.FRAME_L3_TO_L4 and source_matches:
             assert source is not None
             if worker_id != source.worker_id:
                 raise ValueError("source session worker_id mismatch")
@@ -683,10 +686,10 @@ class SidecarProxy:
                 sock = source.sockets.get(envelope.lane)
                 if sock is None:
                     source.queued[envelope.lane].append(envelope.payload)
-                    return
-                sock.sendall(envelope.payload)
+                else:
+                    sock.sendall(envelope.payload)
             return
-        if deliver_to_target and target_matches:
+        if envelope.message_type == MessageType.FRAME_L4_TO_L3 and target_matches:
             assert target is not None
             if worker_id != target.worker_id:
                 raise ValueError("target session worker_id mismatch")
@@ -701,24 +704,10 @@ class SidecarProxy:
             return
         if closed:
             return
-        raise ValueError("FRAME does not match a local sidecar session")
+        raise ValueError("FRAME does not match a local MPI L3 session")
 
-    @staticmethod
-    def _wait_remote_runner_exit(pid: int, timeout_s: float) -> bool:
-        if pid <= 0:
-            return True
-        deadline = time.monotonic() + min(timeout_s, 5.0)
-        while time.monotonic() < deadline:
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                return True
-            except PermissionError:
-                return False
-            time.sleep(0.02)
-        return False
-
-    def _close_session(self, session_id: int, *, require_runner_exit: bool = False) -> None:
+    def _close_session(self, session_id: int) -> None:
+        resources = self._direct_resources.pop(session_id, None)
         with self._state_lock:
             source = self._sources.pop(session_id, None)
             target = self._targets.pop(session_id, None)
@@ -727,86 +716,117 @@ class SidecarProxy:
             source.close()
         if target is not None:
             target.close()
-            exited = self._wait_remote_runner_exit(target.pid, target.runtime_timeout_s)
-            print(
-                json.dumps(
-                    {
-                        "event": "REMOTE_L3_SESSION_CLOSED",
-                        "rank": self.rank,
-                        "session_id": session_id,
-                        "pid": target.pid,
-                        "runner_exited": exited,
-                    },
-                    sort_keys=True,
-                ),
-                flush=True,
-            )
-            if require_runner_exit and not exited:
-                raise RuntimeError(f"remote L3 runner pid {target.pid} did not exit within cleanup deadline")
+        if resources is None:
+            return
+        stop, sockets, threads = resources
+        stop.set()
+        for sock in sockets:
+            with contextlib.suppress(OSError):
+                sock.shutdown(socket.SHUT_RDWR)
+            with contextlib.suppress(OSError):
+                sock.close()
+        current = threading.current_thread()
+        for thread in threads:
+            if thread is not current and thread.is_alive():
+                thread.join(timeout=1.0)
 
-    def _sidecar_loop(self) -> None:
-        assert self._sidecar is not None
-        while not self._stop.is_set():
-            envelope = read_envelope(self._sidecar)
-            if envelope.target_rank != self.rank:
-                raise ValueError("sidecar delivered an envelope for another rank")
-            if envelope.message_type == MessageType.WORLD_READY:
-                world = json.loads(envelope.payload.decode("utf-8"))
-                if int(world["rank"]) != self.rank:
-                    raise ValueError("MPI world rank differs from proxy rank")
-                mapped_workers = _worker_ids_for_rank(str(world["worker_map"]), self.rank)
-                if mapped_workers != self.worker_ids:
-                    raise ValueError("MPI worker map differs from proxy worker assignment")
-                print(json.dumps(world, sort_keys=True), flush=True)
-                if self.rank == 0:
-                    if self.bootstrap_socket is None:
-                        raise ValueError("rank 0 proxy requires --bootstrap-socket")
-                    listener = _bind_unix(self.bootstrap_socket)
-                    self._listeners.append(listener)
-                    threading.Thread(target=self._bootstrap_loop, args=(listener,), daemon=True).start()
-                    print(f"L4 bootstrap READY {self.bootstrap_socket}", flush=True)
-            elif envelope.message_type == MessageType.OPEN_SESSION:
-                threading.Thread(target=self._open_target, args=(envelope,), daemon=True).start()
-            elif envelope.message_type == MessageType.OPEN_SESSION_REPLY:
-                self._handle_open_reply(envelope)
-            elif envelope.message_type in (
-                MessageType.FRAME,
-                MessageType.FRAME_L4_TO_L3,
-                MessageType.FRAME_L3_TO_L4,
-            ):
-                self._deliver_frame(envelope)
-            elif envelope.message_type == MessageType.CLOSE_SESSION:
-                self._close_session(envelope.session_id, require_runner_exit=True)
-            elif envelope.message_type == MessageType.ERROR:
-                raise RuntimeError(envelope.payload.decode("utf-8", errors="replace"))
-            elif envelope.message_type == MessageType.SHUTDOWN:
-                self._stop.set()
+    def _dispatch(self, envelope: Envelope) -> None:
+        if envelope.target_rank != self.rank:
+            raise ValueError("MPI envelope target rank differs from local rank")
+        if envelope.message_type == MessageType.OPEN_SESSION:
+            threading.Thread(target=self._open_target, args=(envelope,), daemon=True).start()
+        elif envelope.message_type == MessageType.OPEN_SESSION_REPLY:
+            self._handle_open_reply(envelope)
+        elif envelope.message_type in (MessageType.FRAME_L4_TO_L3, MessageType.FRAME_L3_TO_L4):
+            self._deliver_frame(envelope)
+        elif envelope.message_type == MessageType.CLOSE_SESSION:
+            self._close_session(envelope.session_id)
+        elif envelope.message_type == MessageType.SHUTDOWN:
+            self._stop.set()
+        else:
+            raise ValueError(f"unsupported direct MPI L3 envelope {envelope.message_type.name}")
 
-    def serve(self) -> int:
-        listener = _bind_unix(self.sidecar_socket)
-        self._listeners.append(listener)
-        print(f"MPI sidecar proxy rank={self.rank} LISTENING {self.sidecar_socket}", flush=True)
+    def _route_outbound(self, transport: MpiTransport, envelope: Envelope) -> None:
+        envelope = replace(envelope, source_rank=self.rank)
+        if envelope.message_type == MessageType.SHUTDOWN:
+            if self.rank != 0:
+                raise RuntimeError("only MPI rank 0 may stop the world")
+            for target in range(self.world_size):
+                routed = replace(envelope, target_rank=target)
+                if target == self.rank:
+                    self._dispatch(routed)
+                else:
+                    transport.send(target, encode_envelope(routed))
+            return
+        if envelope.target_rank == self.rank:
+            if envelope.lane != Lane.HEALTH:
+                _log_event(
+                    "MPI_L3_ROUTE_LOCAL",
+                    rank=self.rank,
+                    message_type=envelope.message_type.name,
+                    session_id=envelope.session_id,
+                )
+            self._dispatch(envelope)
+        else:
+            if envelope.lane != Lane.HEALTH:
+                _log_event(
+                    "MPI_L3_SEND",
+                    rank=self.rank,
+                    target_rank=envelope.target_rank,
+                    message_type=envelope.message_type.name,
+                    session_id=envelope.session_id,
+                )
+            transport.send(envelope.target_rank, encode_envelope(envelope))
+
+    def serve(self, transport: MpiTransport, world_record: dict[str, Any]) -> int:
+        if self.rank == 0:
+            if self.bootstrap_socket is None:
+                raise ValueError("MPI rank 0 requires a bootstrap socket")
+            listener = _bind_unix(self.bootstrap_socket)
+            self._listeners.append(listener)
+            threading.Thread(target=self._bootstrap_loop, args=(listener,), daemon=True).start()
+            _log_event("L4_MPI_L3_GATEWAY_READY", path=self.bootstrap_socket, transport="unix")
+        print(json.dumps(world_record, sort_keys=True), flush=True)
         try:
-            self._sidecar, _ = listener.accept()
-            self._sidecar_loop()
+            while not self._stop.is_set():
+                for _ in range(64):
+                    try:
+                        envelope = self._outbound.get_nowait()
+                    except queue.Empty:
+                        break
+                    self._route_outbound(transport, envelope)
+                while True:
+                    received = transport.receive()
+                    if received is None:
+                        break
+                    source, payload = received
+                    envelope = decode_envelope(payload)
+                    if envelope.source_rank != source:
+                        raise ValueError("MPI source rank differs from envelope metadata")
+                    if envelope.lane != Lane.HEALTH:
+                        _log_event(
+                            "MPI_L3_RECV",
+                            rank=self.rank,
+                            source_rank=source,
+                            message_type=envelope.message_type.name,
+                            session_id=envelope.session_id,
+                        )
+                    self._dispatch(envelope)
+                time.sleep(0.005)
             return 0
         finally:
             self._stop.set()
             for pending in self._pending.values():
-                pending.reply = {"ok": False, "error": "MPI sidecar stopped"}
+                pending.reply = {"ok": False, "error": "direct MPI L3 stopped"}
                 pending.event.set()
             for session_id in list(self._sources) + list(self._targets):
                 self._close_session(session_id)
-            for sock in self._listeners:
+            for listener in self._listeners:
                 with contextlib.suppress(OSError):
-                    sock.close()
-            if self._sidecar is not None:
-                with contextlib.suppress(OSError):
-                    self._sidecar.close()
-            for path in (self.sidecar_socket, self.bootstrap_socket):
-                if path:
-                    with contextlib.suppress(FileNotFoundError):
-                        os.unlink(path)
+                    listener.close()
+            if self.bootstrap_socket:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(self.bootstrap_socket)
 
 
 def stop_world(bootstrap_socket: str, timeout_s: float = 5.0) -> int:
@@ -816,38 +836,5 @@ def stop_world(bootstrap_socket: str, timeout_s: float = 5.0) -> int:
         _send_json(sock, {"version": 1, "op": "STOP_WORLD"})
         reply = _read_json(sock)
     if not reply.get("ok", False):
-        raise RuntimeError(f"MPI sidecar stop failed: {reply.get('error')}")
+        raise RuntimeError(f"MPI world stop failed: {reply.get('error')}")
     return 0
-
-
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--rank", type=int)
-    parser.add_argument("--sidecar-socket")
-    parser.add_argument("--session-dir")
-    parser.add_argument("--worker-ids", default="")
-    parser.add_argument("--bootstrap-socket")
-    parser.add_argument("--stop-world")
-    ns = parser.parse_args(argv)
-    if ns.stop_world:
-        return stop_world(ns.stop_world)
-    if ns.rank is None or not ns.sidecar_socket or not ns.session_dir:
-        parser.error("--rank, --sidecar-socket and --session-dir are required in server mode")
-
-    def terminate(_signum, _frame):
-        raise SystemExit(128 + signal.SIGTERM)
-
-    signal.signal(signal.SIGTERM, terminate)
-    worker_ids = {int(item) for item in ns.worker_ids.split(",") if item}
-    proxy = SidecarProxy(
-        rank=ns.rank,
-        sidecar_socket=ns.sidecar_socket,
-        session_dir=ns.session_dir,
-        worker_ids=worker_ids,
-        bootstrap_socket=ns.bootstrap_socket,
-    )
-    return proxy.serve()
-
-
-if __name__ == "__main__":
-    sys.exit(main())

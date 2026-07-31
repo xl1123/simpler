@@ -6,4 +6,4 @@ set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 config=${1:?usage: run_2host_npu.sh topology.2host-npu.json}
-exec "${PYTHON:-python3}" "${repo_root}/tools/mpi_l4_sidecar/launch.py" --mode npu --config "${config}"
+exec "${PYTHON:-python3}" "${repo_root}/tools/mpi_l3/launch.py" "${config}"

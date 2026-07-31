@@ -74,12 +74,12 @@ private:
     std::vector<uint8_t> read_frame(std::chrono::steady_clock::time_point deadline);
 };
 
-class RemoteL3SidecarTransport : public RemoteL3Transport {
+class RemoteL3UnixTransport : public RemoteL3Transport {
 public:
-    RemoteL3SidecarTransport(
+    RemoteL3UnixTransport(
         std::string command_path, std::string health_path, double attach_timeout_s, double runtime_timeout_s
     );
-    ~RemoteL3SidecarTransport() override;
+    ~RemoteL3UnixTransport() override;
 
     void expect_hello_ready(uint64_t session_id, int32_t worker_id, const std::string &comm_profile);
     void submit_frame(const std::vector<uint8_t> &frame) override;

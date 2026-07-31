@@ -7,12 +7,11 @@ End-user profiling / debug CLIs live in
 [`simpler_setup/tools/`](../simpler_setup/tools/) and ship with the wheel —
 invoke them via `python -m simpler_setup.tools.<name>`.
 
-## mpi_l4_sidecar/
+## mpi_l3/
 
-Build and launch the optional MPI control-plane path integrated into L4's
-`RemoteL3Endpoint`. The validation runs the same real L4 -> L3 -> L2 sim case
-over legacy TCP and MPI sidecar, then compares results. See
-[`mpi_l4_sidecar/README.md`](./mpi_l4_sidecar/README.md).
+Build and launch two MPI-owned L3 ranks from one master terminal. The validation
+runs the real cross-machine L4 -> L3 -> L2 -> NPU case without starting the
+default Remote L3 TCP daemons. See [`mpi_l3/README.md`](./mpi_l3/README.md).
 
 ## benchmark_rounds.sh
 

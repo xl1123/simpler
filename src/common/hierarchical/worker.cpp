@@ -93,14 +93,13 @@ void Worker::add_remote_l3_socket(
     );
 }
 
-void Worker::add_remote_l3_sidecar(
+void Worker::add_remote_l3_unix(
     int32_t worker_id, uint64_t session_id, const std::string &transport_name, const std::string &command_path,
     const std::string &health_path, double attach_timeout_s, double runtime_timeout_s
 ) {
-    if (initialized_) throw std::runtime_error("Worker: add_remote_l3_sidecar after init");
-    auto transport = std::make_unique<RemoteL3SidecarTransport>(
-        command_path, health_path, attach_timeout_s, runtime_timeout_s
-    );
+    if (initialized_) throw std::runtime_error("Worker: add_remote_l3_unix after init");
+    auto transport =
+        std::make_unique<RemoteL3UnixTransport>(command_path, health_path, attach_timeout_s, runtime_timeout_s);
     transport->expect_hello_ready(session_id, worker_id, transport_name);
     manager_.add_next_level_endpoint(
         std::make_unique<RemoteL3Endpoint>(worker_id, session_id, transport_name, std::move(transport))

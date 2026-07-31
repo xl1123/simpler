@@ -4,7 +4,7 @@
     "implementation": "mpich",
     "launcher": "/opt/mpi/bin/mpirun"
   },
-  "sidecar_binary": "/shared/simpler/build/mpi_l4_sidecar/simpler-mpi-l4-sidecar",
+  "mpi_transport_library": "/shared/simpler/build/mpi_l3_transport/libsimpler_mpi_l3_transport.so",
   "platform": "a2a3",
   "runtime": "tensormap_and_ringbuffer",
   "block_dim": 1,
@@ -14,15 +14,15 @@
   "hosts": [
     {
       "rank": 0,
+      "worker_id": 0,
       "local": true,
       "mpi_host": "master-host",
-      "daemon_endpoint": "10.0.0.1:19073",
       "device_ids": [0, 1]
     },
     {
       "rank": 1,
+      "worker_id": 1,
       "mpi_host": "npu-peer-host",
-      "daemon_endpoint": "10.0.0.2:19073",
       "device_ids": [0, 1]
     }
   ]

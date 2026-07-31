@@ -84,7 +84,7 @@ public:
         uint16_t port, const std::string &health_host, uint16_t health_port, double attach_timeout_s,
         double runtime_timeout_s
     );
-    void add_remote_l3_sidecar(
+    void add_remote_l3_unix(
         int32_t worker_id, uint64_t session_id, const std::string &transport_name, const std::string &command_path,
         const std::string &health_path, double attach_timeout_s, double runtime_timeout_s
     );

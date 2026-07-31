@@ -8,11 +8,12 @@
 # -----------------------------------------------------------------------------------------------------------
 
 cmake_minimum_required(VERSION 3.15)
-project(simpler_mpi_l4_sidecar LANGUAGES CXX)
+project(simpler_mpi_l3_transport LANGUAGES CXX)
 
 find_package(MPI REQUIRED COMPONENTS CXX)
 
-add_executable(simpler-mpi-l4-sidecar sidecar_main.cpp sidecar_protocol.cpp)
-target_compile_features(simpler-mpi-l4-sidecar PRIVATE cxx_std_17)
-target_link_libraries(simpler-mpi-l4-sidecar PRIVATE MPI::MPI_CXX)
-target_compile_options(simpler-mpi-l4-sidecar PRIVATE -Wall -Wextra -Wpedantic)
+add_library(simpler_mpi_l3_transport SHARED mpi_l3_transport.cpp)
+target_compile_features(simpler_mpi_l3_transport PRIVATE cxx_std_17)
+target_link_libraries(simpler_mpi_l3_transport PRIVATE MPI::MPI_CXX)
+target_compile_options(simpler_mpi_l3_transport PRIVATE -Wall -Wextra -Wpedantic)
+set_target_properties(simpler_mpi_l3_transport PROPERTIES OUTPUT_NAME simpler_mpi_l3_transport)
